@@ -393,9 +393,28 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
         result['levels'].sort(key=lambda x: x['strike'])
 
     # 2. Fallback: Options-derived
-    if not result['levels'] and spot and gex_df is not None:
-        result['source'] = 'options-derived'
-        result['levels'] = derive_dp_levels_from_options(spot, gex_df)
+    if not result['levels']:
+        # If gex_df wasn't provided, try fetching CBOE data ourselves
+        if (gex_df is None or (hasattr(gex_df, 'empty') and gex_df.empty)) and spot:
+            logger.info("Dark Pool: gex_df missing, trying CBOE fetch for options-derived...")
+            try:
+                from gex_calculator import fetch_cboe_options, parse_options, calculate_gex
+                cboe_spot, options = fetch_cboe_options(ticker)
+                if not spot:
+                    spot = cboe_spot
+                df = parse_options(cboe_spot or spot, options)
+                if not df.empty:
+                    gex_df = calculate_gex(cboe_spot or spot, df)
+                    logger.info(f"Dark Pool: got {len(gex_df)} strikes from CBOE fallback")
+            except Exception as e:
+                logger.warning(f"Dark Pool CBOE fallback failed: {e}")
+
+        if spot and gex_df is not None and not (hasattr(gex_df, 'empty') and gex_df.empty):
+            result['source'] = 'options-derived'
+            result['levels'] = derive_dp_levels_from_options(spot, gex_df)
+            logger.info(f"Dark Pool: options-derived gave {len(result['levels'])} levels")
+        else:
+            logger.warning(f"Dark Pool: no data available (spot={spot}, gex_df={'None' if gex_df is None else 'empty' if hasattr(gex_df, 'empty') and gex_df.empty else 'ok'})")
 
     # 3. FINRA short volume
     finra = fetch_finra_volume(ticker)
