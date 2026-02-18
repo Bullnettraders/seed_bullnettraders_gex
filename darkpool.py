@@ -1,7 +1,7 @@
 """
-BullNet Dark Pool Scanner
-Fetches REAL dark pool prints from ChartExchange via Selenium.
-Falls back to FINRA + options-derived levels if Selenium fails.
+BullNet Dark Pool Scanner v2
+Direct API calls to ChartExchange — NO Selenium needed.
+Falls back to FINRA + options-derived if API fails.
 """
 
 import requests
@@ -15,205 +15,292 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════
-#  SELENIUM — ChartExchange Dark Pool Prints + Levels
+#  CHARTEXCHANGE SYMBOL IDs (internal)
 # ═══════════════════════════════════════════════════════════
 
-def _get_driver():
-    """Create headless Chrome driver."""
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
+# To find new IDs: Open DevTools → Network → XHR → look at datatable POST payload → symbol_
+SYMBOL_IDS = {
+    'QQQ': '2017015',
+    'SPY': '2005153',
+    'GLD': '2011862',
+    'IWM': '2005154',
+    'AAPL': '2000335',
+    'MSFT': '2000653',
+    'AMZN': '2000349',
+    'NVDA': '2000658',
+    'TSLA': '2000783',
+    'META': '2000423',
+    'AMD': '2000348',
+    'GOOGL': '2000458',
+}
 
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36')
-
-    chrome_bin = os.getenv('CHROME_BIN', None)
-    if chrome_bin:
-        options.binary_location = chrome_bin
-
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(30)
-    return driver
-
-
-def _get_exchange_prefix(ticker):
-    """Map ticker to ChartExchange URL prefix."""
-    nasdaq_tickers = {'QQQ', 'AAPL', 'MSFT', 'AMZN', 'GOOGL', 'GOOG', 'META', 'NVDA', 'TSLA', 'AMD', 'NFLX', 'AVGO', 'INTC', 'MU', 'QCOM'}
-    return 'nasdaq' if ticker.upper() in nasdaq_tickers else 'nyse'
+# Exchange prefixes for ChartExchange URLs
+EXCHANGE_MAP = {
+    'QQQ': 'nasdaq', 'AAPL': 'nasdaq', 'MSFT': 'nasdaq', 'AMZN': 'nasdaq',
+    'GOOGL': 'nasdaq', 'META': 'nasdaq', 'NVDA': 'nasdaq', 'TSLA': 'nasdaq',
+    'AMD': 'nasdaq', 'NFLX': 'nasdaq', 'INTC': 'nasdaq',
+    'GLD': 'nyse', 'SPY': 'nyse', 'IWM': 'nyse',
+}
 
 
-def _parse_number(txt):
-    """Parse a number string like '1,234', '$1.5M', '500K'."""
-    txt = txt.replace(',', '').replace('$', '').strip()
-    if not txt:
-        return None
-
-    m = re.match(r'^([\d.]+)\s*([MKB])?$', txt, re.IGNORECASE)
-    if m:
-        val = float(m.group(1))
-        suffix = (m.group(2) or '').upper()
-        if suffix == 'M':
-            val *= 1_000_000
-        elif suffix == 'K':
-            val *= 1_000
-        elif suffix == 'B':
-            val *= 1_000_000_000
-        return val
+def _discover_symbol_id(ticker):
+    """
+    Auto-discover ChartExchange symbol ID by fetching the page source.
+    The ID is embedded in the JavaScript on the page.
+    """
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    url = f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+    }
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"Discovery: page returned {resp.status_code} for {ticker}")
+            return None
+        
+        # Look for symbol ID patterns in the page source
+        # Common patterns: symbol_id = "2017015", "symbolId":"2017015", data-symbol="2017015"
+        patterns = [
+            r'symbol[_\-]?[iI]d["\s:=]+["\']?(\d{5,10})',
+            r'"symbol_":\s*"(\d{5,10})"',
+            r"symbol_.*?['\"](\d{5,10})['\"]",
+            r'data-symbol[_-]?id[=:]["\'](\d{5,10})',
+            r'/(\d{7})\b',  # 7-digit IDs in URLs
+        ]
+        
+        for pattern in patterns:
+            m = re.search(pattern, resp.text)
+            if m:
+                sid = m.group(1)
+                logger.info(f"Discovery: found symbol ID {sid} for {ticker}")
+                SYMBOL_IDS[ticker.upper()] = sid
+                return sid
+        
+        logger.warning(f"Discovery: could not find symbol ID for {ticker} in page source")
+    except Exception as e:
+        logger.warning(f"Discovery failed for {ticker}: {e}")
+    
     return None
 
 
-def fetch_chartexchange_selenium(ticker="QQQ"):
+# ═══════════════════════════════════════════════════════════
+#  CHARTEXCHANGE API — Direct POST (no Selenium!)
+# ═══════════════════════════════════════════════════════════
+
+def fetch_chartexchange_api(ticker="QQQ", max_results=15):
     """
-    Scrape dark pool prints + levels from ChartExchange.
-    Returns (prints_list, levels_list).
+    Fetch dark pool levels directly via ChartExchange's DataTable API.
+    No Selenium, no Chrome — just a POST request.
+    Returns list of {'price': float, 'volume': int, 'trades': int}.
     """
+    symbol_id = SYMBOL_IDS.get(ticker.upper())
+    if not symbol_id:
+        # Try auto-discovery
+        symbol_id = _discover_symbol_id(ticker)
+        if not symbol_id:
+            logger.warning(f"No ChartExchange symbol ID for {ticker}. Known: {list(SYMBOL_IDS.keys())}")
+            return []
+
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+
+    # Yesterday's date (DP data is T+1)
+    today = datetime.now()
+    for days_back in range(1, 5):
+        date = today - timedelta(days=days_back)
+        if date.weekday() < 5:  # Skip weekends
+            date_str = date.strftime('%Y-%m-%d')
+            break
+    else:
+        date_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    url = "https://chartexchange.com/xhr/dark-pool-levels/datatable"
+
+    payload = {
+        "draw": 1,
+        "columns": [
+            {"data": "level", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "trades", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "notional", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "volume", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+        ],
+        "order": [{"column": 3, "dir": "desc"}],  # Sort by volume descending
+        "start": 0,
+        "length": max_results,
+        "search": {"value": "", "regex": False},
+        "symbol_": symbol_id,
+        "date_": date_str,
+        "decimals_": 2,
+        "most_recent_": False,
+    }
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': f'https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://chartexchange.com',
+    }
+
+    levels = []
+
     try:
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-    except ImportError:
-        logger.warning("Selenium not installed — pip install selenium")
-        return [], []
+        logger.info(f"ChartExchange API: POST {url} | symbol={symbol_id} date={date_str}")
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
 
-    exchange = _get_exchange_prefix(ticker)
-    base = f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume"
-    prints_url = f"{base}/dark-pool-prints/"
-    levels_url = f"{base}/dark-pool-levels/"
+        if resp.status_code != 200:
+            logger.warning(f"ChartExchange API returned {resp.status_code}")
+            # Try with most_recent_ = True as fallback
+            payload["most_recent_"] = True
+            payload.pop("date_", None)
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"ChartExchange API fallback also returned {resp.status_code}")
+                return []
 
-    driver = None
-    prints_data = []
-    levels_data = []
+        data = resp.json()
+        records = data.get('data', [])
+        logger.info(f"ChartExchange API: got {len(records)} records")
 
-    try:
-        driver = _get_driver()
-
-        # ─── DARK POOL LEVELS (aggregated — best source) ───
-        logger.info(f"Selenium: fetching DP levels → {levels_url}")
-        driver.get(levels_url)
-
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
-            )
-        except:
-            logger.warning("Timeout waiting for levels table")
-
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        logger.info(f"Selenium: found {len(rows)} level rows")
-
-        for row in rows:
+        for rec in records:
             try:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 3:
-                    continue
-                texts = [c.text.strip() for c in cells]
+                # DataTables returns rendered HTML — extract numbers
+                price = _extract_number(rec.get('level', ''))
+                volume = _extract_number(rec.get('volume', ''))
+                trades = _extract_number(rec.get('trades', ''))
 
-                # ChartExchange Levels table: Column 0 = Price (Level), then Trades, Volume
-                # Explicitly parse first cell as price
-                price = None
-                volume = None
-                trades = None
-
-                # First: find the price — must be a decimal close to typical stock price range
-                for txt in texts:
-                    val = _parse_number(txt)
-                    if val is None:
-                        continue
-                    if price is None and '.' in txt.replace(',', '') and val > 50:
-                        price = val
-                        continue
-                    # After price found, look for volume (large int) and trades (smaller int)
-                    if price is not None and volume is None and val >= 100 and '.' not in txt.replace(',', ''):
-                        volume = int(val)
-                    elif price is not None and volume is not None and trades is None and val >= 1 and val < volume:
-                        trades = int(val)
-
-                # If still no price from decimal search, try first cell directly
-                if price is None and texts:
-                    val = _parse_number(texts[0])
-                    if val and val > 50:
-                        price = val
-
-                if price and volume:
-                    levels_data.append({
+                if price and price > 50 and volume:
+                    levels.append({
                         'price': price,
-                        'volume': volume,
-                        'trades': trades or 0,
+                        'volume': int(volume),
+                        'trades': int(trades) if trades else 0,
                     })
-                    logger.debug(f"  DP Level: price={price} vol={volume} trades={trades}")
-            except:
+                    logger.debug(f"  Level: {price} | Vol: {volume:,.0f} | Trades: {trades}")
+            except Exception as e:
+                logger.debug(f"  Skip record: {e}")
                 continue
 
-        logger.info(f"Selenium: parsed {len(levels_data)} valid levels")
-
-        # ─── DARK POOL PRINTS (individual trades) ───
-        logger.info(f"Selenium: fetching DP prints → {prints_url}")
-        driver.get(prints_url)
-
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
-            )
-        except:
-            logger.warning("Timeout waiting for prints table")
-
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        logger.info(f"Selenium: found {len(rows)} print rows")
-
-        for row in rows:
-            try:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 3:
-                    continue
-                texts = [c.text.strip() for c in cells]
-
-                price = None
-                shares = None
-                dollar_vol = None
-
-                for txt in texts:
-                    val = _parse_number(txt)
-                    if val is None:
-                        continue
-
-                    if price is None and '.' in txt.replace(',', '') and val > 50:
-                        price = val
-                    elif price is not None and shares is None and val >= 100 and '.' not in txt.replace(',', ''):
-                        shares = int(val)
-                    elif price is not None and shares is not None and dollar_vol is None and val > 10000:
-                        dollar_vol = val
-
-                if price and shares:
-                    if not dollar_vol:
-                        dollar_vol = price * shares
-                    prints_data.append({
-                        'price': price,
-                        'shares': shares,
-                        'dollar_volume': dollar_vol,
-                    })
-            except:
-                continue
-
-        logger.info(f"Selenium: parsed {len(prints_data)} valid prints")
+        logger.info(f"ChartExchange API: parsed {len(levels)} valid levels")
 
     except Exception as e:
-        logger.error(f"Selenium error: {e}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
+        logger.error(f"ChartExchange API error: {e}")
 
-    return prints_data, levels_data
+    return levels
+
+
+def _extract_number(val):
+    """Extract a number from a DataTable cell (might be HTML or plain text)."""
+    if val is None:
+        return None
+    # Convert to string and strip HTML tags
+    s = str(val)
+    s = re.sub(r'<[^>]+>', '', s)
+    s = s.replace(',', '').replace('$', '').strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        # Try extracting first number
+        m = re.search(r'[\d.]+', s)
+        if m:
+            return float(m.group())
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
-#  FINRA Short Volume (free, no auth)
+#  CHARTEXCHANGE — Dark Pool Prints (individual trades)
+# ═══════════════════════════════════════════════════════════
+
+def fetch_chartexchange_prints(ticker="QQQ", max_results=50):
+    """
+    Fetch dark pool prints (individual large trades) via ChartExchange API.
+    Returns list of {'price': float, 'shares': int, 'dollar_volume': float}.
+    """
+    symbol_id = SYMBOL_IDS.get(ticker.upper())
+    if not symbol_id:
+        symbol_id = _discover_symbol_id(ticker)
+        if not symbol_id:
+            return []
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+
+    today = datetime.now()
+    for days_back in range(1, 5):
+        date = today - timedelta(days=days_back)
+        if date.weekday() < 5:
+            date_str = date.strftime('%Y-%m-%d')
+            break
+    else:
+        date_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    url = "https://chartexchange.com/xhr/dark-pool-prints/datatable"
+
+    payload = {
+        "draw": 1,
+        "columns": [
+            {"data": "time", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "price", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "size", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+            {"data": "notional", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
+        ],
+        "order": [{"column": 3, "dir": "desc"}],  # Sort by notional value
+        "start": 0,
+        "length": max_results,
+        "search": {"value": "", "regex": False},
+        "symbol_": symbol_id,
+        "date_": date_str,
+        "decimals_": 2,
+        "most_recent_": False,
+    }
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Referer': f'https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': 'https://chartexchange.com',
+    }
+
+    prints = []
+
+    try:
+        logger.info(f"ChartExchange Prints API: POST {url}")
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+
+        if resp.status_code != 200:
+            logger.warning(f"ChartExchange Prints API returned {resp.status_code}")
+            return []
+
+        data = resp.json()
+        records = data.get('data', [])
+        logger.info(f"ChartExchange Prints: got {len(records)} records")
+
+        for rec in records:
+            try:
+                price = _extract_number(rec.get('price', ''))
+                shares = _extract_number(rec.get('size', ''))
+                notional = _extract_number(rec.get('notional', ''))
+
+                if price and price > 50 and shares:
+                    prints.append({
+                        'price': price,
+                        'shares': int(shares),
+                        'dollar_volume': notional or (price * shares),
+                    })
+            except:
+                continue
+
+    except Exception as e:
+        logger.error(f"ChartExchange Prints API error: {e}")
+
+    return prints
+
+
+# ═══════════════════════════════════════════════════════════
+#  FINRA SHORT VOLUME
 # ═══════════════════════════════════════════════════════════
 
 def fetch_finra_volume(ticker="QQQ"):
@@ -300,9 +387,8 @@ def derive_dp_levels_from_options(spot, gex_df):
 def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     """
     Get dark pool levels. Priority:
-    1. ChartExchange Levels (Selenium) — echte aggregierte DP Daten
-    2. ChartExchange Prints (Selenium) — einzelne Trades, selbst aggregiert
-    3. Options-derived — Fallback aus OI/Volume
+    1. ChartExchange API (direct POST — no Selenium!)
+    2. Options-derived — Fallback aus OI/Volume
     Always includes FINRA short volume.
     """
     result = {
@@ -313,14 +399,13 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
         'finra': None,
     }
 
-    # 1. Try ChartExchange via Selenium
+    # 1. Try ChartExchange direct API
     try:
-        prints_data, levels_data = fetch_chartexchange_selenium(ticker)
+        levels_data = fetch_chartexchange_api(ticker)
     except Exception as e:
-        logger.warning(f"Selenium failed: {e}")
-        prints_data, levels_data = [], []
+        logger.warning(f"ChartExchange API failed: {e}")
+        levels_data = []
 
-    # Use pre-aggregated levels (best)
     if levels_data and len(levels_data) >= 3:
         result['source'] = 'chartexchange'
 
@@ -332,6 +417,7 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
         for lvl in sorted(levels_data, key=lambda x: x['volume'], reverse=True)[:8]:
             strike = lvl['price']
             vol = lvl['volume']
+            trades = lvl.get('trades', 0)
 
             if spot:
                 if strike > spot * 1.005:
@@ -340,63 +426,24 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
                     tp = "DP Support"
                 else:
                     tp = "High Volume"
-                if vol > 50000:
+                if vol > 500000:
                     tp = "Block Trade"
             else:
                 tp = "High Volume"
 
             result['levels'].append({
                 'strike': strike, 'type': tp,
-                'volume': vol, 'trades': lvl.get('trades', 0),
+                'volume': vol, 'trades': trades,
                 'dollar_volume': strike * vol,
-            })
-
-        result['levels'].sort(key=lambda x: x['strike'])
-
-    # Or aggregate prints ourselves
-    elif prints_data and len(prints_data) >= 5:
-        result['source'] = 'chartexchange'
-
-        # Filter prints within ±20% of spot
-        if spot and spot > 0:
-            prints_data = [p for p in prints_data if abs(p['price'] - spot) / spot < 0.20]
-
-        price_agg = defaultdict(lambda: {'shares': 0, 'dollar_volume': 0, 'count': 0})
-        for p in prints_data:
-            bucket = round(p['price'])
-            price_agg[bucket]['shares'] += p['shares']
-            price_agg[bucket]['dollar_volume'] += p['dollar_volume']
-            price_agg[bucket]['count'] += 1
-
-        sorted_levels = sorted(price_agg.items(), key=lambda x: x[1]['dollar_volume'], reverse=True)
-
-        for strike, data in sorted_levels[:8]:
-            if spot:
-                if strike > spot * 1.005:
-                    tp = "DP Resistance"
-                elif strike < spot * 0.995:
-                    tp = "DP Support"
-                else:
-                    tp = "High Volume"
-                if data['dollar_volume'] > 5_000_000:
-                    tp = "Block Trade"
-            else:
-                tp = "High Volume"
-
-            result['levels'].append({
-                'strike': float(strike), 'type': tp,
-                'volume': data['shares'],
-                'dollar_volume': data['dollar_volume'],
-                'trades': data['count'],
             })
 
         result['levels'].sort(key=lambda x: x['strike'])
 
     # 2. Fallback: Options-derived
     if not result['levels']:
-        # If gex_df wasn't provided, try fetching CBOE data ourselves
+        logger.info("ChartExchange API returned no data, trying options-derived fallback...")
+
         if (gex_df is None or (hasattr(gex_df, 'empty') and gex_df.empty)) and spot:
-            logger.info("Dark Pool: gex_df missing, trying CBOE fetch for options-derived...")
             try:
                 from gex_calculator import fetch_cboe_options, parse_options, calculate_gex
                 cboe_spot, options = fetch_cboe_options(ticker)
@@ -405,18 +452,14 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
                 df = parse_options(cboe_spot or spot, options)
                 if not df.empty:
                     gex_df = calculate_gex(cboe_spot or spot, df)
-                    logger.info(f"Dark Pool: got {len(gex_df)} strikes from CBOE fallback")
             except Exception as e:
-                logger.warning(f"Dark Pool CBOE fallback failed: {e}")
+                logger.warning(f"CBOE fallback failed: {e}")
 
         if spot and gex_df is not None and not (hasattr(gex_df, 'empty') and gex_df.empty):
             result['source'] = 'options-derived'
             result['levels'] = derive_dp_levels_from_options(spot, gex_df)
-            logger.info(f"Dark Pool: options-derived gave {len(result['levels'])} levels")
-        else:
-            logger.warning(f"Dark Pool: no data available (spot={spot}, gex_df={'None' if gex_df is None else 'empty' if hasattr(gex_df, 'empty') and gex_df.empty else 'ok'})")
 
-    # 3. FINRA short volume
+    # 3. FINRA short volume (always)
     finra = fetch_finra_volume(ticker)
     if finra:
         result['finra'] = finra
@@ -469,7 +512,7 @@ def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
             vol = lvl.get('volume', 0)
             trades = lvl.get('trades', 0)
             vol_str = f"{vol:,}" if vol else "N/A"
-            trade_str = f" | {trades} Trades" if trades else ""
+            trade_str = f" | {trades:,} Trades" if trades else ""
 
             icon = "S" if "Support" in tp else "R" if "Resistance" in tp else "HV" if "High" in tp else "BT"
             lines.append(f"  [{icon}] {tp}:")
