@@ -133,6 +133,88 @@ def push_all_levels(nasdaq_levels=None, nasdaq_spot=0, gold_levels=None, gold_sp
     return success
 
 
+def push_dp_to_github(ticker="QQQ", dp_data=None):
+    """
+    Push Dark Pool levels as CSV to GitHub pine_seeds repo.
+    Creates/updates: data/{ticker}_dp.csv
+    
+    Encodes top 4 DP levels into OHLCV:
+        open  = DP Zone 1 (ETF price)
+        high  = DP Zone 2
+        low   = DP Zone 3
+        close = DP Zone 4
+        volume = number of levels available
+    """
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        logger.warning("GitHub token/username not set — skipping DP push")
+        return False
+
+    if not dp_data or not dp_data.get('levels'):
+        logger.warning("No DP levels to push")
+        return False
+
+    levels = dp_data['levels']
+    # Take top 4 by volume
+    top4 = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:4]
+    # Sort by price for Zone ordering
+    top4 = sorted(top4, key=lambda x: x['strike'])
+
+    dp1 = top4[0]['strike'] if len(top4) > 0 else 0
+    dp2 = top4[1]['strike'] if len(top4) > 1 else 0
+    dp3 = top4[2]['strike'] if len(top4) > 2 else 0
+    dp4 = top4[3]['strike'] if len(top4) > 3 else 0
+
+    now = datetime.now(timezone.utc)
+    unix_ts = int(now.timestamp())
+
+    csv_header = "time,open,high,low,close,volume"
+    new_row = f"{unix_ts},{dp1},{dp2},{dp3},{dp4},{len(levels)}"
+
+    filename = f"{ticker.upper()}_dp"
+    filepath = f"data/{filename}.csv"
+
+    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{REPO_NAME}/contents/{filepath}"
+    headers = {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'BullNet-Bot',
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        existing_sha = None
+        existing_rows = []
+
+        if resp.status_code == 200:
+            file_data = resp.json()
+            existing_sha = file_data['sha']
+            content = base64.b64decode(file_data['content']).decode('utf-8')
+            lines = content.strip().split('\n')
+            if len(lines) > 1:
+                existing_rows = lines[1:][-29:]
+
+        all_rows = existing_rows + [new_row]
+        csv_content = csv_header + "\n" + "\n".join(all_rows) + "\n"
+        content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+
+        payload = {
+            'message': f'DP update {ticker} — {now.strftime("%Y-%m-%d %H:%M")} UTC | {dp1}/{dp2}/{dp3}/{dp4} | {dp_data.get("source", "?")}',
+            'content': content_b64,
+        }
+        if existing_sha:
+            payload['sha'] = existing_sha
+
+        resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+
+        logger.info(f"Pine Seeds: pushed {ticker} DP to GitHub — Z1:{dp1} Z2:{dp2} Z3:{dp3} Z4:{dp4}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Pine Seeds DP push failed: {e}")
+        return False
+
+
 if __name__ == "__main__":
     # Test push
     test_levels = {
