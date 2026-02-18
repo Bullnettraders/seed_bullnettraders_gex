@@ -179,11 +179,16 @@ async def cmd_goldratio(ctx, new_ratio: float = None):
 async def cmd_darkpool(ctx, ticker: str = "QQQ"):
     """Dark Pool levels from previous day."""
     ticker = ticker.upper()
+    is_gold = ticker in ("GLD", "GOLD")
+    r = GOLD_RATIO if is_gold else RATIO
+    etf_label = "GLD" if is_gold else "QQQ"
+    cfd_label = "XAUUSD" if is_gold else "CFD"
+    
     async with ctx.typing():
         try:
-            spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, RATIO)
+            spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, r)
             dp = await asyncio.to_thread(get_dark_pool_levels, ticker, spot, gex_df)
-            msg = format_dp_discord(dp, RATIO)
+            msg = format_dp_discord(dp, r, ticker)
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
@@ -195,9 +200,9 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
     levels = dp.get('levels', [])
     finra = dp.get('finra')
     if levels:
-        color = 0x7B68EE
+        color = 0xFFD700 if is_gold else 0x7B68EE
         embed = Embed(
-            title="BullNet Dark Pool - " + ticker,
+            title="BullNet Dark Pool - " + ("GOLD" if is_gold else ticker),
             description=f"Source: {dp.get('source', 'N/A')} | {len(levels)} Levels",
             color=color, timestamp=datetime.now(timezone.utc)
         )
@@ -207,7 +212,7 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
             vol = lvl.get('volume', 0)
             embed.add_field(
                 name=f"{tp}",
-                value=f"`{strike:.2f}` QQQ\n`{strike*RATIO:.0f}` CFD\nVol: {vol:,}",
+                value=f"`{strike:.2f}` {etf_label}\n`{strike*r:.0f}` {cfd_label}\nVol: {vol:,}",
                 inline=True
             )
         if finra:
@@ -216,7 +221,7 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
                 value=f"`{finra['short_percent']}%`\n{finra['date']}",
                 inline=True
             )
-        embed.set_footer(text="Ratio: " + f"{RATIO:.2f}" + " | BULLNET")
+        embed.set_footer(text="Ratio: " + f"{r:.2f}" + " | BULLNET")
         await ctx.send(embed=embed)
 
 
