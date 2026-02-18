@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 SYMBOL_IDS = {
     'QQQ': '2017015',
     'SPY': '2005153',
-    'GLD': '2011862',
+    'GLD': '1463435',
     'IWM': '2005154',
     'AAPL': '2000335',
     'MSFT': '2000653',
