@@ -393,7 +393,7 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
 #  DISCORD FORMAT
 # ═══════════════════════════════════════════════════════════
 
-def format_dp_discord(dp_data, ratio=41.11, ticker="QQQ"):
+def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
     """Format dark pool data for Discord."""
     def to_cfd(p):
         return round(p * ratio, 2)
