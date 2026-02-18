@@ -19,189 +19,7 @@ STRIKE_RANGE_PCT = 0.20
 
 
 # ═══════════════════════════════════════════════════════════
-#  SOURCE 1: BARCHART (Selenium) — Primary
-# ═══════════════════════════════════════════════════════════
-
-def fetch_barchart_gex(ticker="QQQ"):
-    """
-    Scrape Gamma Flip, Call Wall, Put Wall from Barchart.com.
-    Returns dict with levels or None on failure.
-    """
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-    except ImportError:
-        logger.warning("Selenium not installed")
-        return None
-
-    # Barchart URL pattern
-    asset_type = "etfs-funds" if ticker.upper() in ("QQQ", "SPY", "IWM", "DIA", "GLD", "SLV", "TLT", "XLF", "XLE", "VOO") else "stocks"
-    url = f"https://www.barchart.com/{asset_type}/quotes/{ticker.upper()}/gamma-exposure"
-
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36')
-
-    chrome_bin = os.getenv('CHROME_BIN', None)
-    if chrome_bin:
-        options.binary_location = chrome_bin
-
-    driver = None
-    try:
-        driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(45)
-
-        logger.info(f"Barchart: fetching GEX for {ticker} → {url}")
-        driver.get(url)
-
-        # Wait for gamma flip text to render (JS loaded content)
-        import time
-        max_wait = 20
-        found = False
-        for i in range(max_wait):
-            time.sleep(1)
-            page_text = driver.page_source
-            if 'gamma flip' in page_text.lower() or 'gamma_flip' in page_text.lower():
-                found = True
-                logger.info(f"Barchart: gamma flip text found after {i+1}s")
-                break
-            if i % 5 == 4:
-                logger.info(f"Barchart: waiting for JS... ({i+1}s)")
-
-        if not found:
-            # Try scrolling down to trigger lazy loading
-            driver.execute_script("window.scrollTo(0, 500);")
-            time.sleep(3)
-            page_text = driver.page_source
-            if 'gamma flip' in page_text.lower():
-                found = True
-                logger.info("Barchart: gamma flip found after scroll")
-
-        if not found:
-            # Last resort: try clicking "View All Filters" or similar expand button
-            try:
-                buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'View All')]")
-                for btn in buttons:
-                    btn.click()
-                    time.sleep(2)
-                page_text = driver.page_source
-                if 'gamma flip' in page_text.lower():
-                    found = True
-                    logger.info("Barchart: gamma flip found after clicking expand")
-            except:
-                pass
-
-        if not found:
-            logger.warning(f"Barchart: gamma flip text NOT found after {max_wait}s")
-            # Debug: log a snippet of the page around key terms
-            lower_text = page_text.lower()
-            for term in ['gamma', 'flip', 'put wall', 'call wall', 'exposure']:
-                idx = lower_text.find(term)
-                if idx >= 0:
-                    snippet = page_text[max(0,idx-50):idx+100].replace('\n', ' ')
-                    logger.info(f"Barchart debug '{term}' at pos {idx}: ...{snippet}...")
-
-        page_text = driver.page_source
-        # Also get clean rendered text (no HTML tags)
-        try:
-            rendered_text = driver.find_element(By.TAG_NAME, "body").text
-            logger.info(f"Barchart: rendered text length = {len(rendered_text)}")
-        except:
-            rendered_text = ""
-
-        levels = {}
-
-        # Use rendered text first (clean, no HTML tags), then page_source as fallback
-        for src_name, src_text in [("rendered", rendered_text), ("html", page_text)]:
-            if levels.get('gamma_flip') and levels.get('put_wall') and levels.get('call_wall'):
-                break  # All found
-
-            # Parse gamma flip
-            if 'gamma_flip' not in levels:
-                gf_match = re.search(r'gamma\s*flip\s*(?:point\s*)?(?:is\s*)?(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if not gf_match:
-                    gf_match = re.search(r'gammaFlip["\s:=]+(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if gf_match:
-                    levels['gamma_flip'] = float(gf_match.group(1))
-                    logger.info(f"Barchart [{src_name}]: Gamma Flip = {levels['gamma_flip']}")
-
-            # Parse put wall
-            if 'put_wall' not in levels:
-                pw_match = re.search(r'put\s*wall\s*(?:is\s*)?(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if not pw_match:
-                    pw_match = re.search(r'putWall["\s:=]+(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if pw_match:
-                    levels['put_wall'] = float(pw_match.group(1))
-                    logger.info(f"Barchart [{src_name}]: Put Wall = {levels['put_wall']}")
-
-            # Parse call wall
-            if 'call_wall' not in levels:
-                cw_match = re.search(r'call\s*wall\s*(?:is\s*)?(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if not cw_match:
-                    cw_match = re.search(r'callWall["\s:=]+(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if cw_match:
-                    levels['call_wall'] = float(cw_match.group(1))
-                    logger.info(f"Barchart [{src_name}]: Call Wall = {levels['call_wall']}")
-
-        # Debug: if walls still missing, log what's around them
-        if 'put_wall' not in levels:
-            for src_name, src_text in [("rendered", rendered_text), ("html", page_text)]:
-                idx = src_text.lower().find('put wall')
-                if idx >= 0:
-                    snippet = src_text[idx:idx+150].replace('\n', ' ')
-                    logger.info(f"Barchart debug [{src_name}] put_wall: {snippet}")
-        if 'call_wall' not in levels:
-            for src_name, src_text in [("rendered", rendered_text), ("html", page_text)]:
-                idx = src_text.lower().find('call wall')
-                if idx >= 0:
-                    snippet = src_text[idx:idx+150].replace('\n', ' ')
-                    logger.info(f"Barchart debug [{src_name}] call_wall: {snippet}")
-
-        # Get spot price from page
-        if 'spot' not in levels:
-            for src_name, src_text in [("rendered", rendered_text), ("html", page_text)]:
-                spot_match = re.search(r'Last\s*Price[:\s]*(\d+\.?\d*)', src_text, re.IGNORECASE)
-                if not spot_match:
-                    spot_match = re.search(r'(\d{2,4}\.\d{2})\s*[-+]?\d+\.\d+\s*\(', src_text)
-                if spot_match:
-                    levels['spot'] = float(spot_match.group(1))
-                    logger.info(f"Barchart [{src_name}]: Spot = {levels['spot']}")
-                    break
-
-        # Derive regime
-        if 'gamma_flip' in levels and 'spot' in levels:
-            levels['gamma_regime'] = "Positiv" if levels['spot'] > levels['gamma_flip'] else "Negativ"
-        elif 'gamma_flip' in levels:
-            levels['gamma_regime'] = "N/A"
-
-        if 'gamma_flip' in levels:
-            levels['source'] = 'barchart'
-            logger.info(f"Barchart SUCCESS: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
-            return levels
-        else:
-            logger.warning("Barchart: could not parse gamma flip from page")
-            return None
-
-    except Exception as e:
-        logger.error(f"Barchart error: {e}")
-        return None
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
-
-
-# ═══════════════════════════════════════════════════════════
-#  SOURCE 2: CBOE API — Fallback
+#  GEX SOURCE: CBOE API (Direct)
 # ═══════════════════════════════════════════════════════════
 
 def bs_gamma(S, K, T, r, q, sigma):
@@ -412,57 +230,32 @@ def format_discord_message(spot, levels, ratio=41.33, ticker="QQQ"):
 
 def run(ticker="QQQ", ratio=41.33):
     """
-    Get GEX levels. Priority:
-    1. Barchart (Selenium) — professional data, accurate Gamma Flip
-    2. CBOE API (own calc) — fallback if Selenium fails
+    Get GEX levels.
+    Source: CBOE API with own Gamma Flip calculation.
+    (Barchart removed — no Selenium/Chrome in Docker)
     """
     spot = None
     levels = None
     gex_df = None
 
-    # 1. Try Barchart first
     try:
-        logger.info(f"Trying Barchart for {ticker}...")
-        bc_levels = fetch_barchart_gex(ticker)
-        if bc_levels and 'gamma_flip' in bc_levels:
-            spot = bc_levels.get('spot', 0)
-            levels = bc_levels
-
-            # Still fetch CBOE for HVL and gex_df (needed for dark pool fallback)
-            try:
-                cboe_spot, options = fetch_cboe_options(ticker)
-                if not spot or spot == 0:
-                    spot = cboe_spot
-                df = parse_options(cboe_spot, options)
-                if not df.empty:
-                    gex_df = calculate_gex(cboe_spot, df)
-                    cboe_levels = find_key_levels(cboe_spot, gex_df)
-                    # Add HVL from CBOE if Barchart doesn't have it
-                    if 'hvl' not in levels and 'hvl' in cboe_levels:
-                        levels['hvl'] = cboe_levels['hvl']
-            except Exception as e:
-                logger.warning(f"CBOE supplement failed: {e}")
-
-            logger.info(f"Using Barchart data: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
-            return spot, levels, gex_df
-    except Exception as e:
-        logger.warning(f"Barchart failed: {e}")
-
-    # 2. Fallback to CBOE
-    try:
-        logger.info(f"Falling back to CBOE for {ticker}...")
+        logger.info(f"Fetching CBOE options for {ticker}...")
         spot, options = fetch_cboe_options(ticker)
         if not options:
+            logger.error(f"CBOE: No options data for {ticker}")
             return None, None, None
         df = parse_options(spot, options)
         if df.empty:
+            logger.error(f"CBOE: Empty DataFrame for {ticker}")
             return None, None, None
         gex_df = calculate_gex(spot, df)
         levels = find_key_levels(spot, gex_df)
         levels['source'] = 'cboe'
+        levels['spot'] = spot
+        logger.info(f"CBOE SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')} HVL={levels.get('hvl')}")
         return spot, levels, gex_df
     except Exception as e:
-        logger.error(f"CBOE also failed: {e}")
+        logger.error(f"CBOE failed for {ticker}: {e}")
         raise
 
 
