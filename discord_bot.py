@@ -10,7 +10,7 @@ from discord import Embed
 
 from gex_calculator import run as run_gex, format_discord_message
 from darkpool import get_dark_pool_levels, format_dp_discord
-from pine_seeds import push_gex_to_github
+from pine_seeds import push_gex_to_github, push_dp_to_github
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -97,6 +97,17 @@ async def scheduled_gex():
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
             dp_msg = format_dp_discord(dp, RATIO)
             await channel.send(dp_msg)
+            # Push to GitHub
+            if dp.get('source') == 'chartexchange' and dp.get('levels'):
+                await asyncio.to_thread(push_dp_to_github, "QQQ", dp)
+            # Also push GLD DP
+            try:
+                gld_spot, _, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
+                gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
+                if gld_dp.get('source') == 'chartexchange' and gld_dp.get('levels'):
+                    await asyncio.to_thread(push_dp_to_github, "GLD", gld_dp)
+            except Exception as e:
+                logger.error(f"Scheduled GLD DP error: {e}")
         except Exception as e:
             logger.error(f"Scheduled DP error: {e}")
 
@@ -189,6 +200,9 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
             spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, r)
             dp = await asyncio.to_thread(get_dark_pool_levels, ticker, spot, gex_df)
             msg = format_dp_discord(dp, r, ticker)
+            # Push DP levels to GitHub for Pine Script auto-import
+            if dp.get('source') == 'chartexchange' and dp.get('levels'):
+                await asyncio.to_thread(push_dp_to_github, ticker if not is_gold else "GLD", dp)
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
