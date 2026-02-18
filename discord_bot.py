@@ -23,6 +23,45 @@ GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '10.97'))
 SCHEDULE_ENABLED = os.getenv('SCHEDULE_ENABLED', 'true').lower() == 'true'
 SCHEDULE_HOURS = [14, 17, 20]
 
+
+def auto_update_ratios():
+    """Auto-calculate ratios from live market data."""
+    global RATIO, GOLD_RATIO
+    import requests as req
+    try:
+        # Fetch NAS100 CFD and QQQ
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        # Use Yahoo Finance API for quick quotes
+        qqq_url = "https://query1.finance.yahoo.com/v8/finance/chart/QQQ?range=1d&interval=1d"
+        nas_url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?range=1d&interval=1d"
+        gld_url = "https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1d"
+        gc_url  = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1d"
+
+        qqq_r = req.get(qqq_url, headers=headers, timeout=10)
+        nas_r = req.get(nas_url, headers=headers, timeout=10)
+        gld_r = req.get(gld_url, headers=headers, timeout=10)
+        gc_r  = req.get(gc_url, headers=headers, timeout=10)
+
+        qqq_price = qqq_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        nas_price = nas_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        gld_price = gld_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        gc_price  = gc_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+
+        if qqq_price > 0 and nas_price > 0:
+            new_ratio = round(nas_price / qqq_price, 2)
+            if 30 < new_ratio < 55:  # Sanity check
+                RATIO = new_ratio
+                logger.info(f"Auto-Ratio NAS/QQQ: {RATIO} (NAS={nas_price}, QQQ={qqq_price})")
+
+        if gld_price > 0 and gc_price > 0:
+            new_gold = round(gc_price / gld_price, 2)
+            if 5 < new_gold < 15:  # Sanity check
+                GOLD_RATIO = new_gold
+                logger.info(f"Auto-Ratio XAUUSD/GLD: {GOLD_RATIO} (GC={gc_price}, GLD={gld_price})")
+
+    except Exception as e:
+        logger.warning(f"Auto-ratio failed (using defaults): {e}")
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -85,6 +124,13 @@ async def scheduled_gex():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
+    
+    # Auto-update ratios
+    try:
+        await asyncio.to_thread(auto_update_ratios)
+    except:
+        pass
+    
     # Post GEX
     result = await get_gex_report()
     text_msg, embed = result[0], result[1]
@@ -98,15 +144,28 @@ async def scheduled_gex():
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
             dp_msg = format_dp_discord(dp, RATIO)
             await channel.send(dp_msg)
-            # Push to GitHub
-            if dp.get('source') == 'chartexchange' and dp.get('levels'):
-                await asyncio.to_thread(push_dp_to_github, "QQQ", dp)
-            # Also push GLD DP
+            # Update DP Memory
+            if dp.get('levels'):
+                await asyncio.to_thread(dp_memory_update, "QQQ", dp['levels'], spot)
+            # Push to GitHub (using memory for sticky levels)
+            if dp.get('source') == 'chartexchange':
+                top_zones = get_top_zones("QQQ", n=4, current_price=spot)
+                if top_zones:
+                    mem_dp = dict(dp)
+                    mem_dp['levels'] = [{'strike': z['price'], 'volume': z.get('volume', 0), 'type': z.get('type', 'DP Level')} for z in top_zones]
+                    await asyncio.to_thread(push_dp_to_github, "QQQ", mem_dp)
+            # Also do GLD
             try:
                 gld_spot, _, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
                 gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
-                if gld_dp.get('source') == 'chartexchange' and gld_dp.get('levels'):
-                    await asyncio.to_thread(push_dp_to_github, "GLD", gld_dp)
+                if gld_dp.get('levels'):
+                    await asyncio.to_thread(dp_memory_update, "GLD", gld_dp['levels'], gld_spot)
+                if gld_dp.get('source') == 'chartexchange':
+                    gld_zones = get_top_zones("GLD", n=4, current_price=gld_spot)
+                    if gld_zones:
+                        mem_gld = dict(gld_dp)
+                        mem_gld['levels'] = [{'strike': z['price'], 'volume': z.get('volume', 0), 'type': z.get('type', 'DP Level')} for z in gld_zones]
+                        await asyncio.to_thread(push_dp_to_github, "GLD", mem_gld)
             except Exception as e:
                 logger.error(f"Scheduled GLD DP error: {e}")
         except Exception as e:
@@ -278,6 +337,66 @@ async def cmd_dpmem(ctx, ticker: str = "QQQ"):
     await ctx.send(msg)
 
 
+@bot.command(name='dpadd')
+async def cmd_dpadd(ctx, price: float = 0, volume: int = 200000, ticker: str = "QQQ"):
+    """Manuell ein DP Level zur Memory hinzufügen. Syntax: !dpadd 613.00 850000"""
+    if price <= 0:
+        await ctx.send("Syntax: `!dpadd 613.00 850000` oder `!dpadd 613.00 850000 GLD`")
+        return
+    
+    ticker = ticker.upper()
+    is_gold = ticker in ("GLD", "GOLD")
+    dp_ticker = "GLD" if is_gold else ticker
+    
+    # Get current spot for context
+    r = GOLD_RATIO if is_gold else RATIO
+    try:
+        spot, _, _ = await asyncio.to_thread(run_gex, ticker, r)
+    except:
+        spot = None
+    
+    # Add to memory
+    manual_level = [{'strike': price, 'volume': volume, 'trades': 0, 'type': 'Manual DP'}]
+    active = await asyncio.to_thread(dp_memory_update, dp_ticker, manual_level, spot)
+    
+    dist_str = ""
+    if spot and spot > 0:
+        dist_pct = (price - spot) / spot * 100
+        arrow = "↑" if dist_pct > 0 else "↓"
+        dist_str = f" ({arrow}{abs(dist_pct):.2f}% von Spot)"
+    
+    await ctx.send(f"✅ **{dp_ticker} DP Level hinzugefügt:** {price:.2f} | Vol: {volume:,}{dist_str}\n"
+                   f"Aktive Levels: {len(active)} | Bleibt bis Preis es erreicht (max 14 Tage)")
+
+
+@bot.command(name='dpremove')
+async def cmd_dpremove(ctx, price: float = 0, ticker: str = "QQQ"):
+    """Manuell ein DP Level aus Memory entfernen. Syntax: !dpremove 601.07"""
+    if price <= 0:
+        await ctx.send("Syntax: `!dpremove 601.07` oder `!dpremove 450.00 GLD`")
+        return
+    
+    ticker = ticker.upper()
+    is_gold = ticker in ("GLD", "GOLD")
+    dp_ticker = "GLD" if is_gold else ticker
+    
+    from dp_memory import load_memory, save_memory
+    memory = load_memory()
+    levels = memory.get(dp_ticker, [])
+    
+    before = len(levels)
+    levels = [l for l in levels if abs(l['price'] - price) > 0.05]
+    after = len(levels)
+    
+    if before == after:
+        await ctx.send(f"❌ Level {price:.2f} nicht in Memory gefunden für {dp_ticker}.")
+        return
+    
+    memory[dp_ticker] = levels
+    save_memory(memory)
+    await ctx.send(f"✅ **{dp_ticker} DP Level entfernt:** {price:.2f} | Verbleibend: {after} Levels")
+
+
 @bot.command(name='gamma')
 async def cmd_gamma(ctx):
     async with ctx.typing():
@@ -294,13 +413,19 @@ async def cmd_gamma(ctx):
 
 
 @bot.command(name='ratio')
-async def cmd_ratio(ctx, new_ratio: float = None):
-    global RATIO
-    if new_ratio:
-        RATIO = new_ratio
-        await ctx.send(f"Ratio gesetzt: {RATIO:.2f}")
+async def cmd_ratio(ctx, action: str = None):
+    """Zeige oder aktualisiere Ratios. !ratio auto = Live berechnen"""
+    global RATIO, GOLD_RATIO
+    if action == "auto":
+        await ctx.send("Berechne Ratios aus Live-Daten...")
+        await asyncio.to_thread(auto_update_ratios)
+        await ctx.send(f"✅ **Auto-Ratio:**\nNAS/QQQ: **{RATIO:.2f}**\nXAUUSD/GLD: **{GOLD_RATIO:.2f}**")
+    elif action and action.replace('.','').isdigit():
+        RATIO = float(action)
+        await ctx.send(f"NAS Ratio gesetzt: {RATIO:.2f}")
     else:
-        await ctx.send(f"Aktueller Ratio: {RATIO:.2f}")
+        await ctx.send(f"**Aktuelle Ratios:**\nNAS/QQQ: **{RATIO:.2f}**\nXAUUSD/GLD: **{GOLD_RATIO:.2f}**\n\n"
+                       f"`!ratio auto` = Live berechnen\n`!ratio 41.33` = Manuell setzen")
 
 
 @bot.command(name='levels')
@@ -408,6 +533,12 @@ async def cmd_help_de(ctx):
 @bot.event
 async def on_ready():
     logger.info(f"Bot ready: {bot.user}")
+    # Auto-calculate ratios from live market data
+    try:
+        await asyncio.to_thread(auto_update_ratios)
+        logger.info(f"Ratios: NAS/QQQ={RATIO} | XAUUSD/GLD={GOLD_RATIO}")
+    except Exception as e:
+        logger.warning(f"Auto-ratio on startup failed: {e}")
     if SCHEDULE_ENABLED and CHANNEL_ID > 0:
         scheduled_gex.start()
 
