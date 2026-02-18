@@ -20,8 +20,11 @@ HIT_TOLERANCE = 0.0015
 # Max age in days before a level expires even if not hit
 MAX_AGE_DAYS = 14
 
-# Minimum volume to be remembered (filter noise)
-MIN_VOLUME_TO_REMEMBER = 100000
+# Minimum volume to be remembered (only BIG prints)
+MIN_VOLUME_TO_REMEMBER = 250000
+
+# Max levels to add per day (only the top N by volume)
+MAX_NEW_PER_DAY = 3
 
 
 def load_memory():
@@ -109,11 +112,14 @@ def update_levels(ticker, new_levels, current_price):
         logger.info(f"DP Memory: {expired_count} levels expired for {ticker}")
     
     # ── Step 2: Add new high-volume levels ──
-    # Only add levels above volume threshold that aren't already tracked
+    # Only add TOP 3 levels by volume that aren't already tracked
     existing_prices = set(round(l['price'], 2) for l in active)
     new_count = 0
     
-    for lvl in new_levels:
+    # Sort new levels by volume descending — biggest prints first
+    candidates = sorted(new_levels, key=lambda x: x.get('volume', 0), reverse=True)
+    
+    for lvl in candidates:
         strike = lvl.get('strike', lvl.get('price', 0))
         volume = lvl.get('volume', 0)
         
@@ -132,6 +138,10 @@ def update_levels(ticker, new_levels, current_price):
                     # Track how many days this level appeared
                     a['seen_count'] = a.get('seen_count', 1) + 1
                     break
+            continue
+        
+        # Stop if we already added enough new levels today
+        if new_count >= MAX_NEW_PER_DAY:
             continue
         
         # New level
