@@ -525,6 +525,15 @@ def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
             lines.append(f"  Zone {i}: {lvl['strike']:.2f} {etf_label} = {to_cfd(lvl['strike']):.2f} {cfd_label}  ({lvl['type']})")
         lines.append("")
 
+        # Top 4 by volume for Pine Script indicator
+        top4 = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:4]
+        top4 = sorted(top4, key=lambda x: x['strike'])
+        lines.append("--- INDIKATOR INPUT (Top 4) ---")
+        lines.append("")
+        for i, lvl in enumerate(top4, 1):
+            lines.append(f"  DP Zone {i}: {lvl['strike']:.2f}  ({lvl.get('volume',0):,} Vol)")
+        lines.append("")
+
     else:
         lines.append("  Keine Dark Pool Daten verfuegbar.")
         lines.append("")
