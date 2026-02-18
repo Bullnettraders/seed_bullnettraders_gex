@@ -112,24 +112,31 @@ def fetch_chartexchange_selenium(ticker="QQQ"):
                     continue
                 texts = [c.text.strip() for c in cells]
 
+                # ChartExchange Levels table: Column 0 = Price (Level), then Trades, Volume
+                # Explicitly parse first cell as price
                 price = None
                 volume = None
                 trades = None
 
+                # First: find the price — must be a decimal close to typical stock price range
                 for txt in texts:
                     val = _parse_number(txt)
                     if val is None:
                         continue
-
-                    # Price: has decimal, reasonable range
-                    if price is None and '.' in txt.replace(',', '') and 10 < val < 50000:
+                    if price is None and '.' in txt.replace(',', '') and val > 50:
                         price = val
-                    # Volume: large integer
-                    elif volume is None and val >= 100 and '.' not in txt.replace(',', ''):
+                        continue
+                    # After price found, look for volume (large int) and trades (smaller int)
+                    if price is not None and volume is None and val >= 100 and '.' not in txt.replace(',', ''):
                         volume = int(val)
-                    # Trades: smaller integer after volume found
-                    elif trades is None and volume is not None and val < volume and val >= 1:
+                    elif price is not None and volume is not None and trades is None and val >= 1 and val < volume:
                         trades = int(val)
+
+                # If still no price from decimal search, try first cell directly
+                if price is None and texts:
+                    val = _parse_number(texts[0])
+                    if val and val > 50:
+                        price = val
 
                 if price and volume:
                     levels_data.append({
@@ -137,6 +144,7 @@ def fetch_chartexchange_selenium(ticker="QQQ"):
                         'volume': volume,
                         'trades': trades or 0,
                     })
+                    logger.debug(f"  DP Level: price={price} vol={volume} trades={trades}")
             except:
                 continue
 
@@ -172,11 +180,11 @@ def fetch_chartexchange_selenium(ticker="QQQ"):
                     if val is None:
                         continue
 
-                    if price is None and '.' in txt.replace(',', '') and 10 < val < 50000:
+                    if price is None and '.' in txt.replace(',', '') and val > 50:
                         price = val
-                    elif shares is None and val >= 100 and '.' not in txt.replace(',', ''):
+                    elif price is not None and shares is None and val >= 100 and '.' not in txt.replace(',', ''):
                         shares = int(val)
-                    elif dollar_vol is None and val > 10000:
+                    elif price is not None and shares is not None and dollar_vol is None and val > 10000:
                         dollar_vol = val
 
                 if price and shares:
@@ -316,6 +324,11 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     if levels_data and len(levels_data) >= 3:
         result['source'] = 'chartexchange'
 
+        # Filter: only keep levels within ±20% of spot (sanity check)
+        if spot and spot > 0:
+            levels_data = [l for l in levels_data if abs(l['price'] - spot) / spot < 0.20]
+            logger.info(f"After spot filter (±20% of {spot}): {len(levels_data)} levels remain")
+
         for lvl in sorted(levels_data, key=lambda x: x['volume'], reverse=True)[:8]:
             strike = lvl['price']
             vol = lvl['volume']
@@ -343,6 +356,10 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     # Or aggregate prints ourselves
     elif prints_data and len(prints_data) >= 5:
         result['source'] = 'chartexchange'
+
+        # Filter prints within ±20% of spot
+        if spot and spot > 0:
+            prints_data = [p for p in prints_data if abs(p['price'] - spot) / spot < 0.20]
 
         price_agg = defaultdict(lambda: {'shares': 0, 'dollar_volume': 0, 'count': 0})
         for p in prints_data:
