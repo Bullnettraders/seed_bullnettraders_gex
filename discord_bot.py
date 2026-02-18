@@ -11,6 +11,7 @@ from discord import Embed
 from gex_calculator import run as run_gex, format_discord_message
 from darkpool import get_dark_pool_levels, format_dp_discord
 from pine_seeds import push_gex_to_github, push_dp_to_github
+from dp_memory import update_levels as dp_memory_update, get_top_zones, format_memory_discord
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -200,9 +201,22 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
             spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, r)
             dp = await asyncio.to_thread(get_dark_pool_levels, ticker, spot, gex_df)
             msg = format_dp_discord(dp, r, ticker)
+            
+            # Update DP Memory — track unvisited levels
+            dp_ticker = "GLD" if is_gold else ticker
+            if dp.get('levels'):
+                active_levels = await asyncio.to_thread(dp_memory_update, dp_ticker, dp['levels'], spot)
+                logger.info(f"DP Memory: {len(active_levels)} active levels for {dp_ticker}")
+            
             # Push DP levels to GitHub for Pine Script auto-import
-            if dp.get('source') == 'chartexchange' and dp.get('levels'):
-                await asyncio.to_thread(push_dp_to_github, ticker if not is_gold else "GLD", dp)
+            # Uses MEMORY (sticky levels) instead of just today's data
+            if dp.get('source') == 'chartexchange':
+                top_zones = get_top_zones(dp_ticker, n=4, current_price=spot)
+                if top_zones:
+                    # Override dp data with memory-based top zones for push
+                    mem_dp = dict(dp)
+                    mem_dp['levels'] = [{'strike': z['price'], 'volume': z.get('volume', 0), 'type': z.get('type', 'DP Level')} for z in top_zones]
+                    await asyncio.to_thread(push_dp_to_github, dp_ticker, mem_dp)
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
@@ -243,6 +257,25 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
 async def cmd_dp(ctx, ticker: str = "QQQ"):
     """Shortcut for !darkpool."""
     await cmd_darkpool(ctx, ticker)
+
+
+@bot.command(name='dpmem')
+async def cmd_dpmem(ctx, ticker: str = "QQQ"):
+    """Show active (unvisited) Dark Pool levels from memory."""
+    ticker = ticker.upper()
+    is_gold = ticker in ("GLD", "GOLD")
+    dp_ticker = "GLD" if is_gold else ticker
+    r = GOLD_RATIO if is_gold else RATIO
+    
+    async with ctx.typing():
+        try:
+            spot, _, _ = await asyncio.to_thread(run_gex, ticker, r)
+        except:
+            spot = None
+        
+        msg = format_memory_discord(dp_ticker, spot)
+    
+    await ctx.send(msg)
 
 
 @bot.command(name='gamma')
