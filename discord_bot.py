@@ -246,6 +246,80 @@ async def cmd_goldratio(ctx, new_ratio: float = None):
         await ctx.send(f"Gold Ratio: {GOLD_RATIO:.4f}\nBeispiel: GLD $260 x {GOLD_RATIO:.4f} = XAUUSD ${260*GOLD_RATIO:.2f}")
 
 
+@bot.command(name='setgex')
+async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None, pw: float = None, hvl: float = None):
+    """Manually set GEX levels from Barchart and push to TradingView.
+    Usage: !setgex QQQ 618.62 630 600
+           !setgex GLD 391.72 475 450
+           !setgex GLD 391.72 475 450 460  (with HVL)
+    """
+    if not ticker or not gf or not cw or not pw:
+        await ctx.send("```\n"
+            "!setgex <ticker> <gamma_flip> <call_wall> <put_wall> [hvl]\n\n"
+            "Beispiel:\n"
+            "  !setgex QQQ 618.62 630 600\n"
+            "  !setgex GLD 391.72 475 450\n"
+            "  !setgex GLD 391.72 475 450 460\n\n"
+            "Werte von Barchart Gamma Exposure Seite kopieren.\n"
+            "Pushed automatisch zu TradingView!\n```")
+        return
+
+    ticker = ticker.upper()
+    if hvl is None:
+        hvl = cw  # Default HVL to call wall if not given
+
+    # Determine regime
+    try:
+        # Try to get current spot for regime calculation
+        from gex_calculator import fetch_cboe_options
+        spot, _ = await asyncio.to_thread(fetch_cboe_options, ticker)
+    except:
+        spot = 0
+
+    regime = "Positiv" if spot and spot > gf else "Negativ"
+
+    # Build levels dict
+    levels = {
+        'gamma_flip': gf,
+        'call_wall': cw,
+        'put_wall': pw,
+        'hvl': hvl,
+        'gamma_regime': regime,
+        'source': 'barchart-manual',
+        'spot': spot,
+    }
+
+    # Push to GitHub for TradingView auto-import
+    try:
+        await asyncio.to_thread(push_gex_to_github, ticker, levels, spot or 0)
+        push_ok = True
+    except Exception as e:
+        logger.warning(f"setgex push failed: {e}")
+        push_ok = False
+
+    # Determine labels
+    is_gold = ticker in ("GLD", "GOLD")
+    etf_label = "GLD" if is_gold else ticker
+    r = GOLD_RATIO if is_gold else RATIO
+    cfd_label = "XAUUSD" if is_gold else "NAS100"
+
+    # Build response
+    lines = [
+        f"GEX Levels gesetzt — {ticker}",
+        "=" * 40,
+        f"  Gamma Flip:  {gf:.2f} {etf_label}  =  {gf*r:.2f} {cfd_label}",
+        f"  Call Wall:   {cw:.2f} {etf_label}  =  {cw*r:.2f} {cfd_label}",
+        f"  Put Wall:    {pw:.2f} {etf_label}  =  {pw*r:.2f} {cfd_label}",
+        f"  HVL:         {hvl:.2f} {etf_label}  =  {hvl*r:.2f} {cfd_label}",
+        "",
+        f"  Regime: {regime.upper()}",
+        f"  GitHub Push: {'✅' if push_ok else '❌ Fehler'}",
+        f"  Source: Barchart (manuell)",
+        "=" * 40,
+    ]
+    await ctx.send("```\n" + "\n".join(lines) + "\n```")
+
+
 @bot.command(name='darkpool')
 async def cmd_darkpool(ctx, ticker: str = "QQQ"):
     """Dark Pool levels from previous day."""
