@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 GITHUB_USERNAME = os.getenv('GITHUB_USERNAME', '')
-REPO_NAME = os.getenv('PINE_SEEDS_REPO', 'pine_seeds')
+REPO_NAME = os.getenv('PINE_SEEDS_REPO', 'seed_bullnettraders_gex')
 
 
 def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
