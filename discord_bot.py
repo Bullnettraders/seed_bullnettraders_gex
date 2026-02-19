@@ -10,7 +10,7 @@ from discord import Embed
 
 from gex_calculator import run as run_gex, format_discord_message
 from darkpool import get_dark_pool_levels, format_dp_discord
-from pine_seeds import push_gex_to_github, push_dp_to_github
+from pine_seeds import push_gex_to_github, push_dp_to_github, ensure_symbol_info
 from dp_memory import update_levels as dp_memory_update, get_top_zones, format_memory_discord
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -669,6 +669,11 @@ async def on_ready():
         logger.info(f"Ratios: NAS/QQQ={RATIO} | XAUUSD/GLD={GOLD_RATIO}")
     except Exception as e:
         logger.warning(f"Auto-ratio on startup failed: {e}")
+    # Ensure symbol_info exists for TradingView pine_seeds
+    try:
+        await asyncio.to_thread(ensure_symbol_info)
+    except Exception as e:
+        logger.warning(f"symbol_info check failed: {e}")
     if SCHEDULE_ENABLED and CHANNEL_ID > 0:
         scheduled_gex.start()
 
