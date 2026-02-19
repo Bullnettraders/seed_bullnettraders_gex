@@ -195,7 +195,7 @@ async def scheduled_gex():
             if dp.get('levels'):
                 await asyncio.to_thread(dp_memory_update, "QQQ", dp['levels'], spot)
             # Push to GitHub (using memory for sticky levels)
-            if dp.get('source') == 'chartexchange':
+            if dp.get('levels'):
                 top_zones = get_top_zones("QQQ", n=4, current_price=spot)
                 if top_zones:
                     mem_dp = dict(dp)
@@ -207,7 +207,7 @@ async def scheduled_gex():
                 gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
                 if gld_dp.get('levels'):
                     await asyncio.to_thread(dp_memory_update, "GLD", gld_dp['levels'], gld_spot)
-                if gld_dp.get('source') == 'chartexchange':
+                if gld_dp.get('levels'):
                     gld_zones = get_top_zones("GLD", n=4, current_price=gld_spot)
                     if gld_zones:
                         mem_gld = dict(gld_dp)
@@ -390,7 +390,7 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
             
             # Push DP levels to GitHub for Pine Script auto-import
             # Uses MEMORY (sticky levels) instead of just today's data
-            if dp.get('source') == 'chartexchange':
+            if dp.get('levels'):
                 top_zones = get_top_zones(dp_ticker, n=4, current_price=spot)
                 if top_zones:
                     # Override dp data with memory-based top zones for push
