@@ -11,15 +11,151 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
 RISK_FREE_RATE = 0.045
 DIVIDEND_YIELD = 0.005
 MAX_EXPIRATIONS = 12
 STRIKE_RANGE_PCT = 0.20
 
+# Barchart direct API (no Selenium needed!)
+BARCHART_API = "https://www.barchart.com/proxies/core-api/v1/options/chain/get"
+BARCHART_FIELDS = "symbol,strikePrice,optionType,baseDailyLastPrice,baseLastPrice,dailyGamma,gamma,dailyOpenInterest,openInterest,dailyVolume,volume,daysToExpiration,expirationDate"
+
 
 # ═══════════════════════════════════════════════════════════
-#  GEX SOURCE: CBOE API (Direct)
+#  SOURCE 1: BARCHART API (Direct HTTP — Primary)
+# ═══════════════════════════════════════════════════════════
+
+def fetch_barchart_options(ticker="QQQ"):
+    """
+    Fetch options chain from Barchart's internal API.
+    Returns (spot, records_list) or (None, None) on failure.
+    Barchart provides pre-calculated gamma — no BS model needed.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Referer': f'https://www.barchart.com/etfs-funds/quotes/{ticker}/gamma-exposure',
+    }
+
+    # Fetch all expirations, wide strike range
+    params = {
+        'symbols': ticker.upper(),
+        'raw': '1',
+        'fields': BARCHART_FIELDS,
+        'groupBy': 'strikePrice',
+        'meta': 'field.shortName,field.type,field.description',
+    }
+
+    try:
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # Visit the page first to get cookies (XSRF token etc.)
+        asset_type = "etfs-funds" if ticker.upper() in ("QQQ", "SPY", "IWM", "DIA", "GLD", "SLV", "TLT", "XLF", "XLE", "VOO") else "stocks"
+        page_url = f"https://www.barchart.com/{asset_type}/quotes/{ticker.upper()}/gamma-exposure"
+        try:
+            page_resp = session.get(page_url, timeout=15)
+            # Extract XSRF token from cookies
+            xsrf = session.cookies.get('XSRF-TOKEN', '')
+            if xsrf:
+                session.headers['X-XSRF-TOKEN'] = xsrf
+                logger.info(f"Barchart: got XSRF token ({len(xsrf)} chars)")
+            else:
+                logger.info(f"Barchart: no XSRF token in cookies (keys: {list(session.cookies.keys())})")
+        except Exception as e:
+            logger.warning(f"Barchart: page visit failed (trying API anyway): {e}")
+
+        # Call the API
+        resp = session.get(BARCHART_API, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        count = data.get('count', 0)
+        total = data.get('total', 0)
+        strikes_data = data.get('data', {})
+
+        if not strikes_data:
+            logger.warning(f"Barchart API: empty data for {ticker}")
+            return None, None
+
+        logger.info(f"Barchart API: {ticker} — {count}/{total} records, {len(strikes_data)} strikes")
+
+        # Parse into flat records list
+        records = []
+        spot = None
+
+        for strike_key, options in strikes_data.items():
+            for opt in options:
+                raw = opt.get('raw', opt)
+
+                if spot is None:
+                    spot = raw.get('baseDailyLastPrice') or raw.get('baseLastPrice')
+
+                strike = raw.get('strikePrice', 0)
+                gamma = raw.get('dailyGamma') or raw.get('gamma', 0)
+                oi = raw.get('dailyOpenInterest') or raw.get('openInterest', 0)
+                volume = raw.get('dailyVolume') or raw.get('volume', 0)
+                opt_type = raw.get('optionType', '').lower()
+                dte = raw.get('daysToExpiration', 0)
+
+                if strike <= 0 or gamma <= 0 or oi <= 0:
+                    continue
+
+                records.append({
+                    'strike': float(strike),
+                    'gamma': float(gamma),
+                    'oi': int(oi),
+                    'volume': int(volume),
+                    'type': 'call' if opt_type == 'call' else 'put',
+                    'dte': int(dte),
+                })
+
+        logger.info(f"Barchart API: parsed {len(records)} valid contracts, spot=${spot}")
+        return spot, records
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            logger.warning(f"Barchart API: {e.response.status_code} — may need login/cookies")
+        else:
+            logger.warning(f"Barchart API HTTP error: {e}")
+        return None, None
+    except Exception as e:
+        logger.warning(f"Barchart API failed: {e}")
+        return None, None
+
+
+def calculate_gex_from_barchart(spot, records):
+    """
+    Calculate GEX from Barchart data.
+    Barchart gives us gamma directly — just multiply by OI.
+    """
+    if not records or spot is None or spot <= 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # Dealer GEX: short calls (positive), long puts (negative)
+    df['gex'] = df['gamma'] * df['oi'] * 100 * spot * spot * 0.01
+    df['dealer_gex'] = df.apply(lambda r: r['gex'] if r['type'] == 'call' else -r['gex'], axis=1)
+
+    # Aggregate by strike
+    gex_by_strike = df.groupby('strike').agg(
+        call_gex=('dealer_gex', lambda x: x[df.loc[x.index, 'type'] == 'call'].sum()),
+        put_gex=('dealer_gex', lambda x: x[df.loc[x.index, 'type'] == 'put'].sum()),
+        net_gex=('dealer_gex', 'sum'),
+        total_oi=('oi', 'sum'),
+        total_volume=('volume', 'sum'),
+    ).reset_index().sort_values('strike')
+
+    return gex_by_strike
+
+
+# ═══════════════════════════════════════════════════════════
+#  SOURCE 2: CBOE API (Fallback)
 # ═══════════════════════════════════════════════════════════
 
 def bs_gamma(S, K, T, r, q, sigma):
@@ -138,18 +274,29 @@ def calculate_gex(spot, df):
     return gex_by_strike
 
 
+# ═══════════════════════════════════════════════════════════
+#  SHARED: Find Key Levels from GEX DataFrame
+# ═══════════════════════════════════════════════════════════
+
 def find_key_levels(spot, gex_df):
+    """Find Gamma Flip, Call Wall, Put Wall, HVL from GEX data."""
     levels = {}
     if gex_df.empty:
         return levels
+
+    # Call Wall = strike with highest positive call GEX
     call_data = gex_df[gex_df['call_gex'] > 0]
     if not call_data.empty:
         idx = call_data['call_gex'].idxmax()
         levels['call_wall'] = call_data.loc[idx, 'strike']
+
+    # Put Wall = strike with most negative put GEX
     put_data = gex_df[gex_df['put_gex'] < 0]
     if not put_data.empty:
         idx = put_data['put_gex'].idxmin()
         levels['put_wall'] = put_data.loc[idx, 'strike']
+
+    # Gamma Flip = where net GEX crosses zero (nearest to spot)
     sorted_gex = gex_df.sort_values('strike')
     net_vals = sorted_gex['net_gex'].values
     strikes = sorted_gex['strike'].values
@@ -166,12 +313,18 @@ def find_key_levels(spot, gex_df):
     if gamma_flip is not None:
         levels['gamma_flip'] = round(gamma_flip, 2)
         levels['gamma_regime'] = "Positiv" if spot > gamma_flip else "Negativ"
+
+    # HVL = Highest Volume Level
     if gex_df['total_volume'].sum() > 0:
         idx = gex_df['total_volume'].idxmax()
         levels['hvl'] = gex_df.loc[idx, 'strike']
+
+    # Absolute gamma strike
+    gex_df = gex_df.copy()
     gex_df['abs_gex'] = gex_df['call_gex'].abs() + gex_df['put_gex'].abs()
     idx = gex_df['abs_gex'].idxmax()
     levels['abs_gamma_strike'] = gex_df.loc[idx, 'strike']
+
     return levels
 
 
@@ -225,21 +378,74 @@ def format_discord_message(spot, levels, ratio=41.33, ticker="QQQ"):
 
 
 # ═══════════════════════════════════════════════════════════
-#  MAIN — Barchart first, CBOE fallback
+#  MAIN — Barchart API first, CBOE fallback
 # ═══════════════════════════════════════════════════════════
 
 def run(ticker="QQQ", ratio=41.33):
     """
-    Get GEX levels.
-    Source: CBOE API with own Gamma Flip calculation.
-    (Barchart removed — no Selenium/Chrome in Docker)
+    Get GEX levels. Priority:
+    1. Barchart page text parse (exact pre-calculated values)
+    2. Barchart API + own calculation
+    3. CBOE API (fallback)
     """
     spot = None
     levels = None
     gex_df = None
 
+    # ── 0. Try Barchart page text (exact values from Barchart) ──
     try:
-        logger.info(f"Fetching CBOE options for {ticker}...")
+        from barchart_gex import fetch_barchart_gex
+        logger.info(f"Trying Barchart page text for {ticker}...")
+        bc_levels = fetch_barchart_gex(ticker)
+        if bc_levels and 'gamma_flip' in bc_levels:
+            spot = bc_levels.get('spot', 0)
+            levels = bc_levels
+            logger.info(f"Barchart PAGE SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
+            
+            # Still get CBOE gex_df for HVL if missing
+            if 'hvl' not in levels:
+                try:
+                    cboe_spot, options = fetch_cboe_options(ticker)
+                    if options:
+                        df = parse_options(cboe_spot or spot, options)
+                        if not df.empty:
+                            gex_df = calculate_gex(cboe_spot or spot, df)
+                            cboe_levels = find_key_levels(cboe_spot or spot, gex_df)
+                            if 'hvl' in cboe_levels:
+                                levels['hvl'] = cboe_levels['hvl']
+                except:
+                    pass
+            
+            return spot, levels, gex_df
+    except Exception as e:
+        logger.warning(f"Barchart page parse failed: {e}")
+
+    # ── 1. Try Barchart API (direct, no Selenium) ──
+    try:
+        logger.info(f"Trying Barchart API for {ticker}...")
+        bc_spot, bc_records = fetch_barchart_options(ticker)
+        if bc_spot and bc_records and len(bc_records) > 20:
+            gex_df = calculate_gex_from_barchart(bc_spot, bc_records)
+            if not gex_df.empty:
+                levels = find_key_levels(bc_spot, gex_df)
+                if 'gamma_flip' in levels:
+                    spot = bc_spot
+                    levels['source'] = 'barchart'
+                    levels['spot'] = spot
+                    logger.info(f"Barchart API SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')} HVL={levels.get('hvl')}")
+                    return spot, levels, gex_df
+                else:
+                    logger.warning(f"Barchart API: no gamma flip found for {ticker}, falling back")
+            else:
+                logger.warning(f"Barchart API: empty GEX df for {ticker}")
+        else:
+            logger.warning(f"Barchart API: insufficient data for {ticker} (spot={bc_spot}, records={len(bc_records) if bc_records else 0})")
+    except Exception as e:
+        logger.warning(f"Barchart API failed: {e}")
+
+    # ── 2. Fallback to CBOE ──
+    try:
+        logger.info(f"Falling back to CBOE for {ticker}...")
         spot, options = fetch_cboe_options(ticker)
         if not options:
             logger.error(f"CBOE: No options data for {ticker}")
@@ -255,7 +461,7 @@ def run(ticker="QQQ", ratio=41.33):
         logger.info(f"CBOE SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')} HVL={levels.get('hvl')}")
         return spot, levels, gex_df
     except Exception as e:
-        logger.error(f"CBOE failed for {ticker}: {e}")
+        logger.error(f"CBOE also failed for {ticker}: {e}")
         raise
 
 
