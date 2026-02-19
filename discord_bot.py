@@ -397,6 +397,15 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
                     mem_dp = dict(dp)
                     mem_dp['levels'] = [{'strike': z['price'], 'volume': z.get('volume', 0), 'type': z.get('type', 'DP Level')} for z in top_zones]
                     await asyncio.to_thread(push_dp_to_github, dp_ticker, mem_dp)
+                    logger.info(f"DP GitHub push {dp_ticker}: {len(top_zones)} memory zones")
+                else:
+                    # No memory zones yet — push today's top 4 directly
+                    sorted_levels = sorted(dp['levels'], key=lambda x: x.get('volume', 0), reverse=True)[:4]
+                    if sorted_levels:
+                        direct_dp = dict(dp)
+                        direct_dp['levels'] = sorted_levels
+                        await asyncio.to_thread(push_dp_to_github, dp_ticker, direct_dp)
+                        logger.info(f"DP GitHub push {dp_ticker}: {len(sorted_levels)} direct levels (no memory)")
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
