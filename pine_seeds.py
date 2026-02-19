@@ -143,42 +143,47 @@ def push_all_levels(nasdaq_levels=None, nasdaq_spot=0, gold_levels=None, gold_sp
     return success
 
 
-def push_dp_to_github(ticker="QQQ", dp_data=None):
+def push_dp_to_github(ticker="QQQ", dp_data=None, buy_sell_zones=None):
     """
-    Push Dark Pool levels as CSV to GitHub pine_seeds repo.
+    Push Dark Pool Buy/Sell zones as CSV to GitHub pine_seeds repo.
     Creates/updates: data/{ticker}_dp.csv
     
-    Encodes top 4 DP levels into OHLCV:
-        open  = DP Zone 1 (ETF price)
-        high  = DP Zone 2
-        low   = DP Zone 3
-        close = DP Zone 4
-        volume = number of levels available
+    Encodes Buy/Sell zones into OHLCV:
+        open  = DP Buy 1 (ETF price, biggest Bid cluster)
+        high  = DP Buy 2
+        low   = DP Sell 1 (biggest Ask cluster)
+        close = DP Sell 2
+        volume = 1 (placeholder)
     """
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
         logger.warning("GitHub token/username not set — skipping DP push")
         return False
 
-    if not dp_data or not dp_data.get('levels'):
-        logger.warning("No DP levels to push")
+    # Use buy_sell_zones if provided, otherwise try to extract from dp_data
+    if buy_sell_zones:
+        buy1 = buy_sell_zones.get('buy1', 0)
+        buy2 = buy_sell_zones.get('buy2', 0)
+        sell1 = buy_sell_zones.get('sell1', 0)
+        sell2 = buy_sell_zones.get('sell2', 0)
+    elif dp_data and dp_data.get('levels'):
+        # Fallback: use top 4 generic levels (no direction info)
+        levels = dp_data['levels']
+        top4 = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:4]
+        top4 = sorted(top4, key=lambda x: x['strike'])
+        buy1 = top4[0]['strike'] if len(top4) > 0 else 0
+        buy2 = top4[1]['strike'] if len(top4) > 1 else 0
+        sell1 = top4[2]['strike'] if len(top4) > 2 else 0
+        sell2 = top4[3]['strike'] if len(top4) > 3 else 0
+    else:
+        logger.warning("No DP data to push")
         return False
-
-    levels = dp_data['levels']
-    # Take top 4 by volume
-    top4 = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:4]
-    # Sort by price for Zone ordering
-    top4 = sorted(top4, key=lambda x: x['strike'])
-
-    dp1 = top4[0]['strike'] if len(top4) > 0 else 0
-    dp2 = top4[1]['strike'] if len(top4) > 1 else 0
-    dp3 = top4[2]['strike'] if len(top4) > 2 else 0
-    dp4 = top4[3]['strike'] if len(top4) > 3 else 0
 
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y%m%dT")
 
     # NO HEADER — TradingView pine_seeds format: YYYYMMDDT,open,high,low,close,volume
-    new_row = f"{date_str},{dp1},{dp2},{dp3},{dp4},{len(levels)}"
+    # open=Buy1, high=Buy2, low=Sell1, close=Sell2
+    new_row = f"{date_str},{buy1},{buy2},{sell1},{sell2},1"
 
     filename = f"{ticker.upper()}_dp"
     filepath = f"data/{filename}.csv"
