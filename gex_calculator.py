@@ -96,9 +96,10 @@ def fetch_barchart_options(ticker="QQQ"):
                     spot = raw.get('baseDailyLastPrice') or raw.get('baseLastPrice')
 
                 strike = raw.get('strikePrice', 0)
-                gamma = raw.get('dailyGamma') or raw.get('gamma', 0)
-                oi = raw.get('dailyOpenInterest') or raw.get('openInterest', 0)
-                volume = raw.get('dailyVolume') or raw.get('volume', 0)
+                # EOD fields first — Barchart uses end-of-day data for GEX
+                gamma = raw.get('gamma') or raw.get('dailyGamma', 0)
+                oi = raw.get('openInterest') or raw.get('dailyOpenInterest', 0)
+                volume = raw.get('volume') or raw.get('dailyVolume', 0)
                 opt_type = raw.get('optionType', '').lower()
                 dte = raw.get('daysToExpiration', 0)
 
@@ -392,17 +393,17 @@ def run(ticker="QQQ", ratio=41.33):
     levels = None
     gex_df = None
 
-    # ── 0. Try Barchart page text (exact values from Barchart) ──
+    # ── 0. Try Barchart Playwright (exact JS-rendered values) ──
     try:
         from barchart_gex import fetch_barchart_gex
-        logger.info(f"Trying Barchart page text for {ticker}...")
+        logger.info(f"Trying Barchart Playwright for {ticker}...")
         bc_levels = fetch_barchart_gex(ticker)
         if bc_levels and 'gamma_flip' in bc_levels:
             spot = bc_levels.get('spot', 0)
             levels = bc_levels
-            logger.info(f"Barchart PAGE SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
+            logger.info(f"Barchart Playwright SUCCESS {ticker}: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
             
-            # Still get CBOE gex_df for HVL if missing
+            # Get CBOE gex_df for HVL if missing
             if 'hvl' not in levels:
                 try:
                     cboe_spot, options = fetch_cboe_options(ticker)
@@ -413,12 +414,16 @@ def run(ticker="QQQ", ratio=41.33):
                             cboe_levels = find_key_levels(cboe_spot or spot, gex_df)
                             if 'hvl' in cboe_levels:
                                 levels['hvl'] = cboe_levels['hvl']
-                except:
-                    pass
+                            if not spot or spot == 0:
+                                spot = cboe_spot
+                except Exception as e:
+                    logger.warning(f"CBOE supplement for HVL failed: {e}")
             
             return spot, levels, gex_df
+    except ImportError:
+        logger.warning("barchart_gex module not available")
     except Exception as e:
-        logger.warning(f"Barchart page parse failed: {e}")
+        logger.warning(f"Barchart Playwright failed: {e}")
 
     # ── 1. Try Barchart API (direct, no Selenium) ──
     try:
