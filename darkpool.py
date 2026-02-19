@@ -478,6 +478,84 @@ def _cluster_dp_levels(levels, threshold_pct=0.15):
 
 
 # ═══════════════════════════════════════════════════════════
+#  DIRECTION — Enrich levels with Bid/Ask from Prints
+# ═══════════════════════════════════════════════════════════
+
+def enrich_levels_with_direction(levels, prints, threshold_pct=0.15):
+    """
+    For each DP level, check nearby prints to determine if it's Buy or Sell.
+    
+    Args:
+        levels: list of {'strike': float, 'volume': int, 'type': str, ...}
+        prints: list of {'price': float, 'size': int, 'side': str, ...}
+        threshold_pct: how close a print must be to a level (% of price)
+    
+    Returns: levels with added 'side' field ('Buy', 'Sell', or 'Neutral')
+    """
+    if not prints:
+        return levels
+    
+    for lvl in levels:
+        strike = lvl['strike']
+        threshold = strike * (threshold_pct / 100)
+        
+        # Find prints near this level
+        bid_vol = 0
+        ask_vol = 0
+        for p in prints:
+            if abs(p['price'] - strike) <= threshold:
+                if 'bid' in p.get('side', '').lower():
+                    bid_vol += p.get('size', 0)
+                elif 'ask' in p.get('side', '').lower():
+                    ask_vol += p.get('size', 0)
+        
+        if bid_vol > ask_vol * 1.2:
+            lvl['side'] = 'Buy'
+        elif ask_vol > bid_vol * 1.2:
+            lvl['side'] = 'Sell'
+        else:
+            lvl['side'] = 'Neutral'
+        
+        lvl['bid_vol'] = bid_vol
+        lvl['ask_vol'] = ask_vol
+        logger.debug(f"Level {strike:.2f}: Bid={bid_vol:,} Ask={ask_vol:,} → {lvl['side']}")
+    
+    return levels
+
+
+def get_buy_sell_from_levels(levels):
+    """
+    Extract top 2 Buy and top 2 Sell zones from enriched levels.
+    Returns dict with buy1, buy2, sell1, sell2 (ETF prices).
+    """
+    result = {'buy1': 0.0, 'buy2': 0.0, 'sell1': 0.0, 'sell2': 0.0}
+    
+    buys = sorted([l for l in levels if l.get('side') == 'Buy'],
+                  key=lambda x: x.get('volume', 0), reverse=True)
+    sells = sorted([l for l in levels if l.get('side') == 'Sell'],
+                   key=lambda x: x.get('volume', 0), reverse=True)
+    
+    if len(buys) >= 1:
+        result['buy1'] = buys[0]['strike']
+    if len(buys) >= 2:
+        result['buy2'] = buys[1]['strike']
+    if len(sells) >= 1:
+        result['sell1'] = sells[0]['strike']
+    if len(sells) >= 2:
+        result['sell2'] = sells[1]['strike']
+    
+    # If no direction data, use top levels as fallback
+    if result['buy1'] == 0 and result['sell1'] == 0 and levels:
+        sorted_by_vol = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)
+        if len(sorted_by_vol) >= 1:
+            result['buy1'] = sorted_by_vol[0]['strike']
+        if len(sorted_by_vol) >= 2:
+            result['sell1'] = sorted_by_vol[1]['strike']
+    
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
 #  MAIN — Combine all sources
 # ═══════════════════════════════════════════════════════════
 
@@ -583,6 +661,21 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     if finra:
         result['finra'] = finra
 
+    # 4. Enrich levels with Buy/Sell direction from Prints
+    if result['levels'] and result['source'] == 'chartexchange':
+        try:
+            from chartexchange_prints import fetch_prints_sync
+            min_size = 5000 if ticker.upper() in ("GLD", "SLV") else 100000
+            prints = fetch_prints_sync(ticker, min_size=min_size, max_prints=30)
+            if prints:
+                result['levels'] = enrich_levels_with_direction(result['levels'], prints)
+                result['prints_count'] = len(prints)
+                logger.info(f"Enriched {len(result['levels'])} levels with direction from {len(prints)} prints")
+        except ImportError:
+            logger.info("chartexchange_prints not available — no direction data")
+        except Exception as e:
+            logger.warning(f"Prints enrichment failed: {e}")
+
     logger.info(f"Dark Pool: {len(result['levels'])} levels from {result['source']}")
     return result
 
@@ -630,29 +723,40 @@ def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
             tp = lvl['type']
             vol = lvl.get('volume', 0)
             trades = lvl.get('trades', 0)
+            side = lvl.get('side', '')
             vol_str = f"{vol:,}" if vol else "N/A"
             trade_str = f" | {trades:,} Trades" if trades else ""
 
-            icon = "S" if "Support" in tp else "R" if "Resistance" in tp else "HV" if "High" in tp else "BT"
+            # Direction icon
+            if side == 'Buy':
+                side_icon = "🟢 BUY"
+            elif side == 'Sell':
+                side_icon = "🔴 SELL"
+            else:
+                side_icon = "⚪"
+            
             num_levels = lvl.get('num_levels', 1)
             cluster_str = f" ({num_levels} Levels)" if num_levels > 1 else ""
-            lines.append(f"  [{icon}] {tp}{cluster_str}:")
+            lines.append(f"  [{side_icon}] {tp}{cluster_str}:")
             lines.append(f"      {strike:.2f} {etf_label}  =  {to_cfd(strike):.2f} {cfd_label}  |  Vol: {vol_str}{trade_str}")
             lines.append("")
 
         lines.append(f"--- {cfd_label} INPUT ---")
         lines.append("")
         for i, lvl in enumerate(levels[:8], 1):
-            lines.append(f"  Zone {i}: {lvl['strike']:.2f} {etf_label} = {to_cfd(lvl['strike']):.2f} {cfd_label}  ({lvl['type']})")
+            side = lvl.get('side', '')
+            side_tag = f" [{side}]" if side else ""
+            lines.append(f"  Zone {i}: {lvl['strike']:.2f} {etf_label} = {to_cfd(lvl['strike']):.2f} {cfd_label}  ({lvl['type']}{side_tag})")
         lines.append("")
 
-        # Top 4 by volume for Pine Script indicator
-        top4 = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:4]
-        top4 = sorted(top4, key=lambda x: x['strike'])
-        lines.append("--- INDIKATOR INPUT (Top 4) ---")
+        # Buy/Sell zones for Pine Script indicator
+        buy_sell = get_buy_sell_from_levels(levels)
+        lines.append("--- INDIKATOR INPUT (Buy/Sell) ---")
         lines.append("")
-        for i, lvl in enumerate(top4, 1):
-            lines.append(f"  DP Zone {i}: {lvl['strike']:.2f}  ({lvl.get('volume',0):,} Vol)")
+        lines.append(f"  DP Buy 1:  {buy_sell['buy1']:.2f}" if buy_sell['buy1'] > 0 else "  DP Buy 1:  -")
+        lines.append(f"  DP Buy 2:  {buy_sell['buy2']:.2f}" if buy_sell['buy2'] > 0 else "  DP Buy 2:  -")
+        lines.append(f"  DP Sell 1: {buy_sell['sell1']:.2f}" if buy_sell['sell1'] > 0 else "  DP Sell 1: -")
+        lines.append(f"  DP Sell 2: {buy_sell['sell2']:.2f}" if buy_sell['sell2'] > 0 else "  DP Sell 2: -")
         lines.append("")
 
     else:
