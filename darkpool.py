@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 SYMBOL_IDS = {
     'QQQ': '2017015',
     'SPY': '2005153',
-    'GLD': '1463435',
+    # GLD: auto-discovered (exchange varies: nyse/amex/nysearca)
     'IWM': '2005154',
     'AAPL': '2000335',
     'MSFT': '2000653',
@@ -42,46 +42,59 @@ EXCHANGE_MAP = {
     'GLD': 'nyse', 'SPY': 'nyse', 'IWM': 'nyse',
 }
 
+# Alternative exchanges to try if primary fails
+EXCHANGE_ALTERNATIVES = {
+    'GLD': ['amex', 'nysearca', 'nyse'],
+    'SLV': ['amex', 'nysearca', 'nyse'],
+}
+
 
 def _discover_symbol_id(ticker):
     """
     Auto-discover ChartExchange symbol ID by fetching the page source.
     The ID is embedded in the JavaScript on the page.
+    Tries multiple exchange prefixes if needed.
     """
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
-    url = f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/"
+    exchanges_to_try = EXCHANGE_ALTERNATIVES.get(ticker.upper(), [])
+    primary = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    if primary not in exchanges_to_try:
+        exchanges_to_try = [primary] + exchanges_to_try
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     }
     
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            logger.warning(f"Discovery: page returned {resp.status_code} for {ticker}")
-            return None
-        
-        # Look for symbol ID patterns in the page source
-        # Common patterns: symbol_id = "2017015", "symbolId":"2017015", data-symbol="2017015"
-        patterns = [
-            r'symbol[_\-]?[iI]d["\s:=]+["\']?(\d{5,10})',
-            r'"symbol_":\s*"(\d{5,10})"',
-            r"symbol_.*?['\"](\d{5,10})['\"]",
-            r'data-symbol[_-]?id[=:]["\'](\d{5,10})',
-            r'/(\d{7})\b',  # 7-digit IDs in URLs
-        ]
-        
-        for pattern in patterns:
-            m = re.search(pattern, resp.text)
-            if m:
-                sid = m.group(1)
-                logger.info(f"Discovery: found symbol ID {sid} for {ticker}")
-                SYMBOL_IDS[ticker.upper()] = sid
-                return sid
-        
-        logger.warning(f"Discovery: could not find symbol ID for {ticker} in page source")
-    except Exception as e:
-        logger.warning(f"Discovery failed for {ticker}: {e}")
+    for exchange in exchanges_to_try:
+        url = f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/"
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                logger.info(f"Discovery: {exchange}-{ticker.lower()} returned {resp.status_code}, trying next...")
+                continue
+            
+            # Look for symbol ID patterns in the page source
+            patterns = [
+                r'symbol[_\-]?[iI]d["\s:=]+["\']?(\d{5,10})',
+                r'"symbol_":\s*"(\d{5,10})"',
+                r"symbol_.*?['\"](\d{5,10})['\"]",
+                r'data-symbol[_-]?id[=:]["\'](\d{5,10})',
+                r'/(\d{7})\b',  # 7-digit IDs in URLs
+            ]
+            
+            for pattern in patterns:
+                m = re.search(pattern, resp.text)
+                if m:
+                    sid = m.group(1)
+                    logger.info(f"Discovery: found symbol ID {sid} for {ticker} via {exchange}")
+                    SYMBOL_IDS[ticker.upper()] = sid
+                    EXCHANGE_MAP[ticker.upper()] = exchange
+                    return sid
+            
+            logger.info(f"Discovery: no ID found in {exchange}-{ticker.lower()} page")
+        except Exception as e:
+            logger.warning(f"Discovery {exchange}-{ticker.lower()} failed: {e}")
     
+    logger.warning(f"Discovery: could not find symbol ID for {ticker} in any exchange")
     return None
 
 
@@ -163,6 +176,26 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
         data = resp.json()
         records = data.get('data', [])
         logger.info(f"ChartExchange API: got {len(records)} records")
+
+        # If 0 records with hardcoded ID, try rediscovering
+        if len(records) == 0 and ticker.upper() in SYMBOL_IDS:
+            logger.info(f"ChartExchange: 0 records with ID {symbol_id}, trying rediscovery...")
+            old_id = SYMBOL_IDS.pop(ticker.upper(), None)
+            new_id = _discover_symbol_id(ticker)
+            if new_id and new_id != old_id:
+                logger.info(f"ChartExchange: rediscovered {ticker} ID: {old_id} → {new_id}")
+                payload["symbol_"] = new_id
+                exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+                headers['Referer'] = f'https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/'
+                resp2 = requests.post(url, json=payload, headers=headers, timeout=15)
+                if resp2.status_code == 200:
+                    data = resp2.json()
+                    records = data.get('data', [])
+                    logger.info(f"ChartExchange API retry: got {len(records)} records with new ID {new_id}")
+            else:
+                # Put old ID back
+                if old_id:
+                    SYMBOL_IDS[ticker.upper()] = old_id
 
         for rec in records:
             try:
@@ -399,12 +432,27 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
         'finra': None,
     }
 
-    # 1. Try ChartExchange direct API
+    # 0. Try ChartExchange Playwright (browser-based, bypasses server blocks)
     try:
-        levels_data = fetch_chartexchange_api(ticker)
-    except Exception as e:
-        logger.warning(f"ChartExchange API failed: {e}")
+        from chartexchange_dp import fetch_dp_sync
+        logger.info(f"Trying ChartExchange Playwright for {ticker} DP...")
+        levels_data = fetch_dp_sync(ticker)
+        if levels_data and len(levels_data) >= 3:
+            logger.info(f"ChartExchange Playwright SUCCESS: {len(levels_data)} levels")
+    except ImportError:
+        logger.info("chartexchange_dp module not available, using API...")
         levels_data = []
+    except Exception as e:
+        logger.warning(f"ChartExchange Playwright failed: {e}")
+        levels_data = []
+
+    # 1. Fallback: ChartExchange direct API
+    if not levels_data or len(levels_data) < 3:
+        try:
+            levels_data = fetch_chartexchange_api(ticker)
+        except Exception as e:
+            logger.warning(f"ChartExchange API failed: {e}")
+            levels_data = []
 
     if levels_data and len(levels_data) >= 3:
         result['source'] = 'chartexchange'
