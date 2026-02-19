@@ -1,0 +1,22 @@
+{
+    "QQQ_gex": {
+        "symbol": "QQQ_gex",
+        "description": "BullNet QQQ GEX Levels",
+        "pricescale": 100
+    },
+    "GLD_gex": {
+        "symbol": "GLD_gex",
+        "description": "BullNet GLD GEX Levels",
+        "pricescale": 100
+    },
+    "QQQ_dp": {
+        "symbol": "QQQ_dp",
+        "description": "BullNet QQQ Dark Pool Zones",
+        "pricescale": 100
+    },
+    "GLD_dp": {
+        "symbol": "GLD_dp",
+        "description": "BullNet GLD Dark Pool Zones",
+        "pricescale": 100
+    }
+}
