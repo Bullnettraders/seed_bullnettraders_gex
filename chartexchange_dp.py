@@ -1,9 +1,7 @@
 """
-ChartExchange Dark Pool Scraper — Playwright (Headless Chromium)
-Fetches EXACT dark pool levels from ChartExchange.
-Values are JS-rendered → needs real browser.
-
-Replaces the broken POST API approach (ChartExchange blocks server requests).
+ChartExchange Dark Pool Prints Scraper — Playwright
+Fetches top block trades with direction (Bid/Ask/Mid) from ChartExchange.
+T+1 data — yesterday's prints.
 """
 
 import asyncio
@@ -13,37 +11,32 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Cache to avoid hammering
-_cache = {}  # ticker -> {levels, timestamp}
-CACHE_TTL = 300  # 5 minutes
+_cache = {}
+CACHE_TTL = 600  # 10 min
 
 EXCHANGE_MAP = {
     'QQQ': 'nasdaq', 'SPY': 'nyse', 'IWM': 'nyse',
     'GLD': 'nyse', 'SLV': 'nyse',
-    'AAPL': 'nasdaq', 'MSFT': 'nasdaq', 'AMZN': 'nasdaq',
-    'NVDA': 'nasdaq', 'TSLA': 'nasdaq', 'META': 'nasdaq',
-    'AMD': 'nasdaq', 'GOOGL': 'nasdaq',
 }
 
 
 def _get_url(ticker):
     exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
-    return f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/"
+    return f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/dark-pool-prints/"
 
 
-async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
+async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
     """
-    Fetch dark pool levels from ChartExchange using Playwright.
-    Returns list of {'price': float, 'volume': int, 'trades': int}
-    or empty list on failure.
+    Fetch dark pool prints from ChartExchange using Playwright.
+    Returns list of {time, price, size, premium, side, exchange}
+    filtered by min_size.
     """
     ticker = ticker.upper()
 
-    # Check cache
     cached = _cache.get(ticker)
     if cached and (time.time() - cached['timestamp']) < CACHE_TTL:
-        logger.info(f"ChartExchange DP cache hit for {ticker}")
-        return cached['levels']
+        logger.info(f"DP Prints cache hit for {ticker}")
+        return cached['prints']
 
     try:
         from playwright.async_api import async_playwright
@@ -51,7 +44,7 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
         logger.error("Playwright not installed!")
         return []
 
-    levels = []
+    prints = []
 
     try:
         async with async_playwright() as p:
@@ -62,7 +55,6 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
                     '--disable-extensions',
-                    '--disable-background-networking',
                     '--no-first-run',
                 ]
             )
@@ -75,45 +67,74 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
             page = await context.new_page()
             url = _get_url(ticker)
 
-            logger.info(f"ChartExchange Playwright: loading {ticker} DP...")
+            logger.info(f"DP Prints Playwright: loading {ticker}...")
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
 
-            # Wait for Dark Pool Levels table to render
+            # Wait for table to render
             try:
                 await page.wait_for_selector(
-                    '#darkpoollevels table tbody tr, [id*="darkpool"] table tbody tr',
+                    'table tbody tr',
                     timeout=15000
                 )
-                logger.info(f"ChartExchange Playwright: DP table found")
+                logger.info(f"DP Prints: table found")
             except Exception:
-                logger.info(f"ChartExchange Playwright: waiting for JS render...")
+                logger.info(f"DP Prints: waiting for JS render...")
                 await asyncio.sleep(5)
 
-            # Scroll to dark pool section to trigger lazy loading
-            await page.evaluate("document.querySelector('#darkpoollevels')?.scrollIntoView()")
-            await asyncio.sleep(2)
+            # Sort by Size descending — click Size header
+            try:
+                # Find the Size column header and click to sort
+                await page.evaluate("""() => {
+                    const tables = document.querySelectorAll('table');
+                    for (const table of tables) {
+                        const headers = table.querySelectorAll('thead th');
+                        for (const th of headers) {
+                            if (th.textContent.trim().toLowerCase() === 'size' || 
+                                th.textContent.trim().toLowerCase() === 'premium') {
+                                // Premium is default sort, Size is what we want
+                                if (th.textContent.trim().toLowerCase() === 'size') {
+                                    th.click();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }""")
+                await asyncio.sleep(2)
+            except Exception:
+                pass
 
-            # Try extracting from DataTable via JS
+            # Extract rows from table
             rows = await page.evaluate("""() => {
                 const results = [];
-                // Find all tables on page, look for one with Level/Trades/Volume headers
                 const tables = document.querySelectorAll('table');
                 for (const table of tables) {
                     const headers = table.querySelectorAll('thead th');
                     const headerTexts = Array.from(headers).map(h => h.textContent.trim().toLowerCase());
                     
-                    if (headerTexts.includes('level') && headerTexts.includes('volume')) {
+                    if (headerTexts.includes('time') && headerTexts.includes('price') && headerTexts.includes('size')) {
+                        const timeIdx = headerTexts.indexOf('time');
+                        const priceIdx = headerTexts.indexOf('price');
+                        const sizeIdx = headerTexts.indexOf('size');
+                        const premiumIdx = headerTexts.indexOf('premium');
+                        const sideIdx = headerTexts.indexOf('side');
+                        const exchangeIdx = headerTexts.indexOf('exchange');
+                        
                         const tbody = table.querySelector('tbody');
                         if (!tbody) continue;
                         
                         const trs = tbody.querySelectorAll('tr');
                         for (const tr of trs) {
                             const tds = tr.querySelectorAll('td');
-                            if (tds.length >= 3) {
-                                const level = tds[0]?.textContent.trim();
-                                const trades = tds[1]?.textContent.trim();
-                                const volume = tds[2]?.textContent.trim() || tds[3]?.textContent.trim();
-                                results.push({level, trades, volume});
+                            if (tds.length >= 4) {
+                                results.push({
+                                    time: timeIdx >= 0 ? tds[timeIdx]?.textContent.trim() : '',
+                                    price: priceIdx >= 0 ? tds[priceIdx]?.textContent.trim() : '',
+                                    size: sizeIdx >= 0 ? tds[sizeIdx]?.textContent.trim() : '',
+                                    premium: premiumIdx >= 0 ? tds[premiumIdx]?.textContent.trim() : '',
+                                    side: sideIdx >= 0 ? tds[sideIdx]?.textContent.trim() : '',
+                                    exchange: exchangeIdx >= 0 ? tds[exchangeIdx]?.textContent.trim() : '',
+                                });
                             }
                         }
                         if (results.length > 0) break;
@@ -122,81 +143,129 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
                 return results;
             }""")
 
-            logger.info(f"ChartExchange Playwright: extracted {len(rows)} rows")
-
-            # If JS extraction failed, try text parsing as fallback
-            if not rows:
-                text = await page.evaluate("document.body.innerText")
-                logger.info(f"ChartExchange Playwright: fallback text parsing ({len(text)} chars)")
-                
-                # Look for price-like patterns near volume numbers
-                # Format: "459.94    405    216,874    99.75M"
-                pattern = r'(\d{2,4}\.\d{2})\s+(\d[\d,]*)\s+(\d[\d,]*)\s+'
-                matches = re.findall(pattern, text)
-                for m in matches[:max_levels]:
-                    try:
-                        price = float(m[0])
-                        trades = int(m[1].replace(',', ''))
-                        volume = int(m[2].replace(',', ''))
-                        if volume > 100:  # Filter noise
-                            levels.append({
-                                'price': price,
-                                'volume': volume,
-                                'trades': trades,
-                            })
-                    except (ValueError, IndexError):
-                        continue
-
+            logger.info(f"DP Prints Playwright: extracted {len(rows)} rows")
             await browser.close()
 
-            # Parse JS-extracted rows
-            if rows and not levels:
-                for row in rows[:max_levels]:
-                    try:
-                        price_str = re.sub(r'[^\d.]', '', row.get('level', ''))
-                        vol_str = re.sub(r'[^\d]', '', row.get('volume', ''))
-                        trades_str = re.sub(r'[^\d]', '', row.get('trades', ''))
-                        
-                        price = float(price_str) if price_str else 0
-                        volume = int(vol_str) if vol_str else 0
-                        trades = int(trades_str) if trades_str else 0
-                        
-                        if price > 0 and volume > 0:
-                            levels.append({
-                                'price': price,
-                                'volume': volume,
-                                'trades': trades,
-                            })
-                    except (ValueError, IndexError):
-                        continue
+            # Parse rows
+            for row in rows:
+                try:
+                    price = float(re.sub(r'[^\d.]', '', row.get('price', '0')))
+                    size = int(re.sub(r'[^\d]', '', row.get('size', '0')))
+                    side = row.get('side', '').strip()
+                    time_str = row.get('time', '').strip()
+                    exchange = row.get('exchange', '').strip()
+                    premium_str = row.get('premium', '')
+
+                    # Parse premium (e.g., "484.05M" or "62.01M")
+                    premium = 0
+                    pm = re.match(r'([\d.]+)\s*([MKB]?)', premium_str)
+                    if pm:
+                        val = float(pm.group(1))
+                        suffix = pm.group(2)
+                        if suffix == 'M':
+                            premium = val * 1_000_000
+                        elif suffix == 'K':
+                            premium = val * 1_000
+                        elif suffix == 'B':
+                            premium = val * 1_000_000_000
+                        else:
+                            premium = val
+
+                    if size >= min_size and price > 0:
+                        prints.append({
+                            'time': time_str,
+                            'price': price,
+                            'size': size,
+                            'premium': premium,
+                            'side': side,  # "Bid", "Ask", "Mid"
+                            'exchange': exchange,
+                        })
+                except (ValueError, IndexError):
+                    continue
 
     except Exception as e:
-        logger.error(f"ChartExchange Playwright error: {e}")
+        logger.error(f"DP Prints Playwright error: {e}")
         return []
 
-    # Sort by volume descending
-    levels.sort(key=lambda x: x['volume'], reverse=True)
-    levels = levels[:max_levels]
+    # Sort by size descending
+    prints.sort(key=lambda x: x['size'], reverse=True)
+    prints = prints[:max_prints]
 
-    if levels:
-        _cache[ticker] = {'levels': levels, 'timestamp': time.time()}
-        logger.info(f"ChartExchange DP SUCCESS {ticker}: {len(levels)} levels, "
-                     f"top: ${levels[0]['price']} vol={levels[0]['volume']}")
+    if prints:
+        _cache[ticker] = {'prints': prints, 'timestamp': time.time()}
+        logger.info(f"DP Prints SUCCESS {ticker}: {len(prints)} block trades, "
+                     f"top: {prints[0]['size']:,} @ ${prints[0]['price']:.2f} ({prints[0]['side']})")
     else:
-        logger.warning(f"ChartExchange Playwright: no DP levels found for {ticker}")
+        logger.warning(f"DP Prints: no prints found for {ticker}")
 
-    return levels
+    return prints
 
 
-def fetch_dp_sync(ticker="QQQ", max_levels=15):
+def fetch_prints_sync(ticker="QQQ", min_size=100000, max_prints=15):
     """Synchronous wrapper."""
     try:
-        return asyncio.run(fetch_dp_playwright(ticker, max_levels))
+        return asyncio.run(fetch_prints_playwright(ticker, min_size, max_prints))
     except RuntimeError:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(fetch_dp_playwright(ticker, max_levels))
+        result = loop.run_until_complete(fetch_prints_playwright(ticker, min_size, max_prints))
         loop.close()
         return result
+
+
+def format_prints_discord(prints, ticker="QQQ", ratio=41.33):
+    """Format prints for Discord."""
+    is_gold = ticker.upper() in ("GLD", "GOLD")
+    etf_label = "GLD" if is_gold else "QQQ"
+    cfd_label = "XAUUSD" if is_gold else "NAS100 CFD"
+    title = "BullNet Block Trades - GOLD" if is_gold else f"BullNet Block Trades - {ticker.upper()}"
+
+    if not prints:
+        return f"```\n{title}\n{'='*44}\n  Keine Block Trades gefunden.\n{'='*44}\n```"
+
+    # Summary: count Bid vs Ask
+    bid_count = sum(1 for p in prints if 'bid' in p['side'].lower())
+    ask_count = sum(1 for p in prints if 'ask' in p['side'].lower())
+    mid_count = sum(1 for p in prints if 'mid' in p['side'].lower())
+
+    bid_vol = sum(p['size'] for p in prints if 'bid' in p['side'].lower())
+    ask_vol = sum(p['size'] for p in prints if 'ask' in p['side'].lower())
+
+    if bid_vol > ask_vol * 1.2:
+        bias = "BULLISH 🟢"
+    elif ask_vol > bid_vol * 1.2:
+        bias = "BEARISH 🔴"
+    else:
+        bias = "NEUTRAL ⚪"
+
+    lines = []
+    lines.append(f"```")
+    lines.append(title)
+    lines.append("=" * 44)
+    lines.append(f"  Top Block Trades (>{100}K Shares)")
+    lines.append(f"  Bid: {bid_count} ({bid_vol:,}) | Ask: {ask_count} ({ask_vol:,}) | Mid: {mid_count}")
+    lines.append(f"  Block Trade Bias: {bias}")
+    lines.append("")
+
+    for i, p in enumerate(prints[:10], 1):
+        side_icon = "🟢" if 'bid' in p['side'].lower() else "🔴" if 'ask' in p['side'].lower() else "⚪"
+        cfd_price = round(p['price'] * ratio, 2)
+        premium_str = ""
+        if p['premium'] >= 1_000_000:
+            premium_str = f" ${p['premium']/1_000_000:.1f}M"
+        elif p['premium'] >= 1_000:
+            premium_str = f" ${p['premium']/1_000:.0f}K"
+
+        lines.append(f"  {side_icon} {p['price']:.2f} {etf_label} = {cfd_price:.0f} {cfd_label}")
+        lines.append(f"     {p['size']:,} Shares | {p['side']}{premium_str}")
+        lines.append(f"     {p['time']}  [{p['exchange']}]")
+        lines.append("")
+
+    lines.append("=" * 44)
+    lines.append(f"  Ratio: {ratio:.4f} | Daten: Vortag (T+1)")
+    lines.append(f"  → !dp {ticker} fuer Buy/Sell Zonen im Indikator")
+    lines.append(f"```")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
@@ -205,12 +274,13 @@ if __name__ == "__main__":
     async def test():
         for t in ["QQQ", "GLD"]:
             print(f"\n{'='*40}")
-            print(f"  {t} Dark Pool Levels (Playwright)")
+            print(f"  {t} Dark Pool Prints (Playwright)")
             print(f"{'='*40}")
-            result = await fetch_dp_playwright(t)
+            result = await fetch_prints_playwright(t, min_size=100000)
             if result:
-                for i, lvl in enumerate(result[:10], 1):
-                    print(f"  {i}. ${lvl['price']:.2f}  Vol: {lvl['volume']:,}  Trades: {lvl['trades']}")
+                for i, p in enumerate(result[:10], 1):
+                    side_icon = "BUY" if 'bid' in p['side'].lower() else "SELL" if 'ask' in p['side'].lower() else "MID"
+                    print(f"  {i}. ${p['price']:.3f} x {p['size']:,}  [{side_icon}]  {p['time']}")
             else:
                 print("  FAILED")
 
