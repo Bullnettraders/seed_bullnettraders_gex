@@ -73,32 +73,78 @@ def fetch_barchart_gex(ticker="QQQ"):
         page_text = resp.text
         logger.info(f"Barchart: page loaded ({len(page_text)} chars)")
 
-        # ── Step 2: Parse gamma flip from page text ──
-        # Barchart renders: "QQQ gamma flip point is 618.62"
+        # ── Step 2: Strip HTML tags for cleaner text parsing ──
+        # Barchart may render: "<strong>GLD</strong> gamma flip point is <strong>391.72</strong>"
+        clean_text = re.sub(r'<[^>]+>', ' ', page_text)
+        clean_text = re.sub(r'\s+', ' ', clean_text)
+
+        # Parse gamma flip: "GLD gamma flip point is 391.72"
         gf_match = re.search(
             rf'{ticker}\s+gamma\s+flip\s+point\s+is\s+(\d+\.?\d*)',
-            page_text, re.IGNORECASE
+            clean_text, re.IGNORECASE
         )
         if gf_match:
             levels['gamma_flip'] = float(gf_match.group(1))
             logger.info(f"Barchart: Gamma Flip = {levels['gamma_flip']}")
 
-        # "QQQ put wall is 600.00. QQQ call wall is 630.00"
+        # "GLD put wall is 450.00"
         pw_match = re.search(
             rf'{ticker}\s+put\s+wall\s+is\s+(\d+\.?\d*)',
-            page_text, re.IGNORECASE
+            clean_text, re.IGNORECASE
         )
         if pw_match:
             levels['put_wall'] = float(pw_match.group(1))
             logger.info(f"Barchart: Put Wall = {levels['put_wall']}")
 
+        # "GLD call wall is 475.00"
         cw_match = re.search(
             rf'{ticker}\s+call\s+wall\s+is\s+(\d+\.?\d*)',
-            page_text, re.IGNORECASE
+            clean_text, re.IGNORECASE
         )
         if cw_match:
             levels['call_wall'] = float(cw_match.group(1))
             logger.info(f"Barchart: Call Wall = {levels['call_wall']}")
+
+        # Also try JSON embedded in page (Angular data)
+        if 'gamma_flip' not in levels:
+            # Try: "gammaFlipPoint":391.72  or "gamma_flip":391.72
+            gf_json = re.search(r'["\']?gamma[_\s]?[Ff]lip[_\s]?[Pp]oint["\']?\s*[=:]\s*["\']?(\d+\.?\d*)', page_text)
+            if gf_json:
+                levels['gamma_flip'] = float(gf_json.group(1))
+                logger.info(f"Barchart JSON: Gamma Flip = {levels['gamma_flip']}")
+
+        if 'gamma_flip' not in levels:
+            # Try broader: any "gamma flip" near a number
+            gf_broad = re.search(r'gamma\s*flip[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
+            if gf_broad:
+                levels['gamma_flip'] = float(gf_broad.group(1))
+                logger.info(f"Barchart BROAD: Gamma Flip = {levels['gamma_flip']}")
+
+        if 'put_wall' not in levels:
+            pw_broad = re.search(r'put\s*wall[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
+            if pw_broad:
+                levels['put_wall'] = float(pw_broad.group(1))
+                logger.info(f"Barchart BROAD: Put Wall = {levels['put_wall']}")
+
+        if 'call_wall' not in levels:
+            cw_broad = re.search(r'call\s*wall[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
+            if cw_broad:
+                levels['call_wall'] = float(cw_broad.group(1))
+                logger.info(f"Barchart BROAD: Call Wall = {levels['call_wall']}")
+
+        # Debug: log snippets around key terms if not found
+        if 'gamma_flip' not in levels:
+            for term in ['gamma flip', 'gammaFlip', 'gamma_flip']:
+                idx = clean_text.lower().find(term.lower())
+                if idx >= 0:
+                    snippet = clean_text[idx:idx+120]
+                    logger.info(f"Barchart DEBUG '{term}' at {idx}: {snippet}")
+            # Also check raw HTML
+            for term in ['gamma flip', 'gammaFlip', 'flipPoint']:
+                idx = page_text.lower().find(term.lower())
+                if idx >= 0:
+                    snippet = page_text[idx:idx+200].replace('\n', ' ')
+                    logger.info(f"Barchart RAW '{term}' at {idx}: {snippet}")
 
         # ── Step 3: If page text worked, we're done ──
         if 'gamma_flip' in levels:
@@ -176,8 +222,26 @@ def _fetch_via_api(session, ticker):
 
         data = resp.json()
 
-        # Data structure: {"data": [{"raw": {...}}, ...]}
-        raw_data = data.get('data', [])
+        # Data structure depends on groupBy:
+        # With groupBy=strikePrice: {"data": {"250.00": [...], "255.00": [...]}}
+        # Without groupBy: {"data": [...]}
+        raw_data = data.get('data', {})
+        
+        if isinstance(raw_data, dict):
+            # groupBy response — flatten all strike groups
+            all_records = []
+            for strike_key, options_list in raw_data.items():
+                if isinstance(options_list, list):
+                    all_records.extend(options_list)
+                else:
+                    all_records.append(options_list)
+            raw_data = all_records
+        elif isinstance(raw_data, list):
+            pass  # already a flat list
+        else:
+            logger.warning(f"Barchart API: unexpected data type: {type(raw_data)}")
+            return None
+
         if not raw_data:
             logger.warning("Barchart API: no data returned")
             return None
@@ -205,9 +269,13 @@ def _calculate_gex_from_barchart(raw_data, ticker):
     strikes_data = {}  # strike -> {call_gex, put_gex, net_gex}
 
     for item in raw_data:
-        raw = item.get('raw', item)  # handle both formats
+        if isinstance(item, str):
+            continue  # skip string keys
+        raw = item.get('raw', item) if isinstance(item, dict) else {}
+        if not isinstance(raw, dict):
+            continue
 
-        strike = float(raw.get('strikePrice', 0))
+        strike = float(raw.get('strikePrice', 0) or 0)
         opt_type = raw.get('optionType', '').lower()
         gamma = float(raw.get('dailyGamma', 0) or raw.get('gamma', 0) or 0)
         oi = int(raw.get('dailyOpenInterest', 0) or raw.get('openInterest', 0) or 0)
