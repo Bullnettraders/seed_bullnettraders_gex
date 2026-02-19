@@ -186,7 +186,7 @@ async def scheduled_gex():
         await channel.send(embed=embed)
     # Post Dark Pool + Block Trades at first schedule only (14:00 UTC)
     if now.hour == 14:
-        from darkpool import enrich_levels_with_direction, get_buy_sell_from_levels
+        from darkpool import get_top_dp_zones
         from chartexchange_prints import fetch_prints_sync, format_prints_discord
 
         # ── QQQ ──
@@ -194,33 +194,28 @@ async def scheduled_gex():
             spot, _, gex_df = await asyncio.to_thread(run_gex, "QQQ", RATIO)
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
 
-            # Fetch Prints → enrich levels with direction
-            try:
-                qqq_prints = await asyncio.to_thread(fetch_prints_sync, "QQQ", 100000, 30)
-                if qqq_prints and dp.get('levels'):
-                    dp['levels'] = enrich_levels_with_direction(dp['levels'], qqq_prints)
-            except Exception as e:
-                logger.warning(f"QQQ prints fetch: {e}")
-                qqq_prints = []
-
-            # Post combined DP levels (with Buy/Sell direction)
+            # Post DP levels
             dp_msg = format_dp_discord(dp, RATIO)
             await channel.send(dp_msg)
 
             # Post raw block trades
-            if qqq_prints:
-                prints_msg = format_prints_discord(qqq_prints, "QQQ", RATIO)
-                if len(prints_msg) > 1950:
-                    prints_msg = prints_msg[:1950] + "\n```"
-                await channel.send(prints_msg)
+            try:
+                qqq_prints = await asyncio.to_thread(fetch_prints_sync, "QQQ", 100000, 15)
+                if qqq_prints:
+                    prints_msg = format_prints_discord(qqq_prints, "QQQ", RATIO)
+                    if len(prints_msg) > 1950:
+                        prints_msg = prints_msg[:1950] + "\n```"
+                    await channel.send(prints_msg)
+            except Exception as e:
+                logger.warning(f"QQQ prints: {e}")
 
-            # Update DP Memory + push to GitHub
+            # Update DP Memory + push top 4 zones to GitHub
             if dp.get('levels'):
                 await asyncio.to_thread(dp_memory_update, "QQQ", dp['levels'], spot)
-                zones = get_buy_sell_from_levels(dp['levels'])
-                if zones.get('buy1', 0) > 0 or zones.get('sell1', 0) > 0:
+                zones = get_top_dp_zones(dp['levels'])
+                if zones.get('dp1', 0) > 0:
                     await asyncio.to_thread(push_dp_to_github, "QQQ", None, zones)
-                    logger.info(f"QQQ DP push: B1={zones['buy1']} B2={zones['buy2']} S1={zones['sell1']} S2={zones['sell2']}")
+                    logger.info(f"QQQ DP push: {zones}")
         except Exception as e:
             logger.error(f"Scheduled QQQ DP error: {e}")
 
@@ -229,34 +224,29 @@ async def scheduled_gex():
             gld_spot, _, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
             gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
 
-            # Fetch Prints → enrich levels with direction
-            try:
-                gld_prints = await asyncio.to_thread(fetch_prints_sync, "GLD", 5000, 30)
-                if gld_prints and gld_dp.get('levels'):
-                    gld_dp['levels'] = enrich_levels_with_direction(gld_dp['levels'], gld_prints)
-            except Exception as e:
-                logger.warning(f"GLD prints fetch: {e}")
-                gld_prints = []
-
-            # Post combined DP levels (with Buy/Sell direction)
+            # Post DP levels
             if gld_dp.get('levels'):
                 gld_msg = format_dp_discord(gld_dp, GOLD_RATIO, "GLD")
                 await channel.send(gld_msg)
 
             # Post raw block trades
-            if gld_prints:
-                gld_prints_msg = format_prints_discord(gld_prints, "GLD", GOLD_RATIO)
-                if len(gld_prints_msg) > 1950:
-                    gld_prints_msg = gld_prints_msg[:1950] + "\n```"
-                await channel.send(gld_prints_msg)
+            try:
+                gld_prints = await asyncio.to_thread(fetch_prints_sync, "GLD", 5000, 15)
+                if gld_prints:
+                    gld_prints_msg = format_prints_discord(gld_prints, "GLD", GOLD_RATIO)
+                    if len(gld_prints_msg) > 1950:
+                        gld_prints_msg = gld_prints_msg[:1950] + "\n```"
+                    await channel.send(gld_prints_msg)
+            except Exception as e:
+                logger.warning(f"GLD prints: {e}")
 
-            # Update DP Memory + push to GitHub
+            # Update DP Memory + push top 4 zones to GitHub
             if gld_dp.get('levels'):
                 await asyncio.to_thread(dp_memory_update, "GLD", gld_dp['levels'], gld_spot)
-                gld_zones = get_buy_sell_from_levels(gld_dp['levels'])
-                if gld_zones.get('buy1', 0) > 0 or gld_zones.get('sell1', 0) > 0:
+                gld_zones = get_top_dp_zones(gld_dp['levels'])
+                if gld_zones.get('dp1', 0) > 0:
                     await asyncio.to_thread(push_dp_to_github, "GLD", None, gld_zones)
-                    logger.info(f"GLD DP push: B1={gld_zones['buy1']} B2={gld_zones['buy2']} S1={gld_zones['sell1']} S2={gld_zones['sell2']}")
+                    logger.info(f"GLD DP push: {gld_zones}")
         except Exception as e:
             logger.error(f"Scheduled GLD DP error: {e}")
 
@@ -411,35 +401,18 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
 
 @bot.command(name='darkpool')
 async def cmd_darkpool(ctx, ticker: str = "QQQ"):
-    """Dark Pool levels + direction from previous day."""
+    """Dark Pool levels from previous day."""
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     r = GOLD_RATIO if is_gold else RATIO
     etf_label = "GLD" if is_gold else "QQQ"
     cfd_label = "XAUUSD" if is_gold else "CFD"
     dp_ticker = "GLD" if is_gold else ticker
-    min_print_size = 5000 if is_gold else 100000
     
     async with ctx.typing():
         try:
             spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, r)
             dp = await asyncio.to_thread(get_dark_pool_levels, ticker, spot, gex_df)
-            
-            # Fetch Prints for direction
-            prints_data = []
-            try:
-                from chartexchange_prints import fetch_prints_sync
-                prints_data = await asyncio.to_thread(fetch_prints_sync, dp_ticker, min_print_size, 30)
-                logger.info(f"DP Prints for {dp_ticker}: {len(prints_data)} block trades")
-            except Exception as e:
-                logger.warning(f"Prints fetch failed for {dp_ticker}: {e}")
-            
-            # Combine: enrich levels with Bid/Ask direction from prints
-            if dp.get('levels') and prints_data:
-                from darkpool import enrich_levels_with_direction
-                dp['levels'] = enrich_levels_with_direction(dp['levels'], prints_data)
-                enriched = sum(1 for l in dp['levels'] if l.get('side') in ('Buy', 'Sell'))
-                logger.info(f"DP enriched: {enriched}/{len(dp['levels'])} levels have direction")
             
             msg = format_dp_discord(dp, r, ticker)
             
@@ -448,13 +421,13 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
                 active_levels = await asyncio.to_thread(dp_memory_update, dp_ticker, dp['levels'], spot)
                 logger.info(f"DP Memory: {len(active_levels)} active levels for {dp_ticker}")
             
-            # Push DP Buy/Sell zones to GitHub
+            # Push top 4 DP zones to GitHub
             if dp.get('levels'):
-                from darkpool import get_buy_sell_from_levels
-                zones = get_buy_sell_from_levels(dp['levels'])
-                if zones.get('buy1', 0) > 0 or zones.get('sell1', 0) > 0:
+                from darkpool import get_top_dp_zones
+                zones = get_top_dp_zones(dp['levels'])
+                if zones.get('dp1', 0) > 0:
                     await asyncio.to_thread(push_dp_to_github, dp_ticker, None, zones)
-                    logger.info(f"DP GitHub push {dp_ticker}: B1={zones['buy1']} B2={zones['buy2']} S1={zones['sell1']} S2={zones['sell2']}")
+                    logger.info(f"DP GitHub push {dp_ticker}: {zones}")
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
@@ -476,11 +449,10 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
             strike = lvl['strike']
             tp = lvl['type']
             vol = lvl.get('volume', 0)
-            side = lvl.get('side', '')
-            side_emoji = "🟢" if side == 'Buy' else "🔴" if side == 'Sell' else "⚪"
-            side_label = f" {side_emoji} {side}" if side else ""
+            num = lvl.get('num_levels', 1)
+            cluster_tag = f" ({num}x)" if num > 1 else ""
             embed.add_field(
-                name=f"{tp}{side_label}",
+                name=f"{tp}{cluster_tag}",
                 value=f"`{strike:.2f}` {etf_label}\n`{strike*r:.0f}` {cfd_label}\nVol: {vol:,}",
                 inline=True
             )
