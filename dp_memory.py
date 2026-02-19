@@ -21,10 +21,22 @@ HIT_TOLERANCE = 0.0015
 MAX_AGE_DAYS = 14
 
 # Minimum volume to be remembered (only BIG prints)
-MIN_VOLUME_TO_REMEMBER = 250000
+# GLD has much lower volume than QQQ — use different thresholds
+MIN_VOLUME_QQQ = 250000
+MIN_VOLUME_GLD = 5000
+MIN_VOLUME_DEFAULT = 100000
 
 # Max levels to add per day (only the top N by volume)
 MAX_NEW_PER_DAY = 3
+
+
+def _get_min_volume(ticker):
+    t = ticker.upper()
+    if t in ("GLD", "GOLD", "SLV"):
+        return MIN_VOLUME_GLD
+    elif t in ("QQQ", "SPY", "IWM"):
+        return MIN_VOLUME_QQQ
+    return MIN_VOLUME_DEFAULT
 
 
 def load_memory():
@@ -123,7 +135,7 @@ def update_levels(ticker, new_levels, current_price):
         strike = lvl.get('strike', lvl.get('price', 0))
         volume = lvl.get('volume', 0)
         
-        if volume < MIN_VOLUME_TO_REMEMBER:
+        if volume < _get_min_volume(ticker):
             continue
         
         strike_r = round(strike, 2)
