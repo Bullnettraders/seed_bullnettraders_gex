@@ -414,6 +414,70 @@ def derive_dp_levels_from_options(spot, gex_df):
 
 
 # ═══════════════════════════════════════════════════════════
+#  CLUSTERING — Merge nearby levels into zones
+# ═══════════════════════════════════════════════════════════
+
+def _cluster_dp_levels(levels, threshold_pct=0.15):
+    """
+    Cluster nearby dark pool levels into zones.
+    
+    Levels within threshold_pct% of each other are merged.
+    Result: volume-weighted average price, summed volume/trades.
+    
+    Example: 459.27, 459.35, 459.36, 459.40, 459.50, 459.94
+    With 0.15% threshold (~$0.69 at $460):
+      Cluster 1: 459.27-459.50 → one zone
+      Cluster 2: 459.94 → separate zone
+    """
+    if not levels:
+        return []
+    
+    # Sort by price ascending
+    sorted_levels = sorted(levels, key=lambda x: x['price'])
+    
+    clusters = []
+    current_cluster = [sorted_levels[0]]
+    
+    for i in range(1, len(sorted_levels)):
+        lvl = sorted_levels[i]
+        # Compare to the volume-weighted center of current cluster
+        cluster_center = sum(l['price'] * l['volume'] for l in current_cluster) / max(sum(l['volume'] for l in current_cluster), 1)
+        
+        # If within threshold, add to cluster
+        if abs(lvl['price'] - cluster_center) / cluster_center < (threshold_pct / 100):
+            current_cluster.append(lvl)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [lvl]
+    
+    clusters.append(current_cluster)  # Don't forget last cluster
+    
+    # Merge each cluster into a single zone
+    merged = []
+    for cluster in clusters:
+        total_vol = sum(l['volume'] for l in cluster)
+        total_trades = sum(l.get('trades', 0) for l in cluster)
+        
+        # Volume-weighted average price
+        if total_vol > 0:
+            vwap = sum(l['price'] * l['volume'] for l in cluster) / total_vol
+        else:
+            vwap = sum(l['price'] for l in cluster) / len(cluster)
+        
+        merged.append({
+            'price': round(vwap, 2),
+            'volume': total_vol,
+            'trades': total_trades,
+            'num_levels': len(cluster),  # How many raw levels merged
+        })
+    
+    logger.info(f"Clustering: {len(levels)} raw → {len(merged)} zones "
+                f"(threshold: {threshold_pct}%)")
+    
+    return merged
+
+
+# ═══════════════════════════════════════════════════════════
 #  MAIN — Combine all sources
 # ═══════════════════════════════════════════════════════════
 
@@ -462,7 +526,13 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
             levels_data = [l for l in levels_data if abs(l['price'] - spot) / spot < 0.20]
             logger.info(f"After spot filter (±20% of {spot}): {len(levels_data)} levels remain")
 
-        for lvl in sorted(levels_data, key=lambda x: x['volume'], reverse=True)[:8]:
+        # ── Cluster nearby levels into zones ──
+        # Levels within 0.15% of each other are merged into one zone
+        # Representative price = volume-weighted average, volumes summed
+        clustered = _cluster_dp_levels(levels_data, threshold_pct=0.15)
+        logger.info(f"Clustered {len(levels_data)} levels → {len(clustered)} zones")
+
+        for lvl in sorted(clustered, key=lambda x: x['volume'], reverse=True)[:8]:
             strike = lvl['price']
             vol = lvl['volume']
             trades = lvl.get('trades', 0)
@@ -480,9 +550,10 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
                 tp = "High Volume"
 
             result['levels'].append({
-                'strike': strike, 'type': tp,
+                'strike': round(strike, 2), 'type': tp,
                 'volume': vol, 'trades': trades,
                 'dollar_volume': strike * vol,
+                'num_levels': lvl.get('num_levels', 1),
             })
 
         result['levels'].sort(key=lambda x: x['strike'])
@@ -563,7 +634,9 @@ def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
             trade_str = f" | {trades:,} Trades" if trades else ""
 
             icon = "S" if "Support" in tp else "R" if "Resistance" in tp else "HV" if "High" in tp else "BT"
-            lines.append(f"  [{icon}] {tp}:")
+            num_levels = lvl.get('num_levels', 1)
+            cluster_str = f" ({num_levels} Levels)" if num_levels > 1 else ""
+            lines.append(f"  [{icon}] {tp}{cluster_str}:")
             lines.append(f"      {strike:.2f} {etf_label}  =  {to_cfd(strike):.2f} {cfd_label}  |  Vol: {vol_str}{trade_str}")
             lines.append("")
 
