@@ -52,9 +52,10 @@ def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
     # Encode regime as number for OHLCV
     regime_val = 1 if regime == "Positiv" else -1 if regime == "Negativ" else 0
 
-    # Use current UTC timestamp
+    # Use midnight UTC timestamp — TradingView request.seed() matches on day boundaries
     now = datetime.now(timezone.utc)
-    unix_ts = int(now.timestamp())
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    unix_ts = int(midnight.timestamp())
 
     # Build CSV — TradingView needs: time, open, high, low, close, volume
     # We keep a rolling history (last 30 days) so TradingView can plot
@@ -92,8 +93,10 @@ def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
                 # Keep last 29 rows + new one = 30 total
                 existing_rows = existing_rows[-29:]
 
-        # Build final CSV
-        all_rows = existing_rows + [new_row]
+        # Build final CSV — replace today's row if exists, otherwise append
+        today_ts_str = str(unix_ts)
+        filtered_rows = [r for r in existing_rows if not r.startswith(today_ts_str + ",")]
+        all_rows = filtered_rows[-29:] + [new_row]
         csv_content = csv_header + "\n" + "\n".join(all_rows) + "\n"
 
         # Encode to base64
@@ -165,7 +168,8 @@ def push_dp_to_github(ticker="QQQ", dp_data=None):
     dp4 = top4[3]['strike'] if len(top4) > 3 else 0
 
     now = datetime.now(timezone.utc)
-    unix_ts = int(now.timestamp())
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    unix_ts = int(midnight.timestamp())
 
     csv_header = "time,open,high,low,close,volume"
     new_row = f"{unix_ts},{dp1},{dp2},{dp3},{dp4},{len(levels)}"
@@ -193,7 +197,9 @@ def push_dp_to_github(ticker="QQQ", dp_data=None):
             if len(lines) > 1:
                 existing_rows = lines[1:][-29:]
 
-        all_rows = existing_rows + [new_row]
+        today_ts_str = str(unix_ts)
+        filtered_rows = [r for r in existing_rows if not r.startswith(today_ts_str + ",")]
+        all_rows = filtered_rows[-29:] + [new_row]
         csv_content = csv_header + "\n" + "\n".join(all_rows) + "\n"
         content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
 
