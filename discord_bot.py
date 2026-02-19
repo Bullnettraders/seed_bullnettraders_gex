@@ -122,6 +122,11 @@ async def get_gex_report(ticker="QQQ", ratio=None):
     if not levels:
         return None, None, "Levels leer - keine Daten berechnet"
     
+    # Fix regime if N/A but we have spot + gamma_flip
+    gf = levels.get('gamma_flip', 0)
+    if levels.get('gamma_regime', 'N/A') == 'N/A' and spot and spot > 0 and gf > 0:
+        levels['gamma_regime'] = "Positiv" if spot > gf else "Negativ"
+    
     text_msg = format_discord_message(spot, levels, r, ticker)
     gf = levels.get('gamma_flip', 0)
     cw = levels.get('call_wall', 0)
