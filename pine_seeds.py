@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 GITHUB_USERNAME = os.getenv('GITHUB_USERNAME', '')
-REPO_NAME = 'pine_seeds'
+REPO_NAME = os.getenv('PINE_SEEDS_REPO', 'pine_seeds')
 
 
 def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
@@ -52,15 +52,13 @@ def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
     # Encode regime as number for OHLCV
     regime_val = 1 if regime == "Positiv" else -1 if regime == "Negativ" else 0
 
-    # Use midnight UTC timestamp — TradingView request.seed() matches on day boundaries
+    # Use YYYYMMDDT format — TradingView requirement for pine_seeds
     now = datetime.now(timezone.utc)
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    unix_ts = int(midnight.timestamp())
+    date_str = now.strftime("%Y%m%dT")
 
-    # Build CSV — TradingView needs: time, open, high, low, close, volume
-    # We keep a rolling history (last 30 days) so TradingView can plot
-    csv_header = "time,open,high,low,close,volume"
-    new_row = f"{unix_ts},{gf},{cw},{pw},{hvl},{regime_val}"
+    # Build CSV — NO HEADER, TradingView pine_seeds format
+    # Format: YYYYMMDDT,open,high,low,close,volume
+    new_row = f"{date_str},{gf},{cw},{pw},{hvl},{regime_val}"
 
     # Determine file path in repo
     filename = f"{ticker.upper()}_gex"
@@ -87,17 +85,26 @@ def push_gex_to_github(ticker="QQQ", levels=None, spot=0):
             content = base64.b64decode(file_data['content']).decode('utf-8')
             lines = content.strip().split('\n')
 
-            # Keep header + existing data rows (max 30 days)
-            if len(lines) > 1:
-                existing_rows = lines[1:]  # skip header
-                # Keep last 29 rows + new one = 30 total
-                existing_rows = existing_rows[-29:]
+            # Filter out: header rows, empty lines, today's row (will be replaced)
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('time') or line.startswith('time,'):
+                    continue  # skip old header
+                if line.startswith(date_str):
+                    continue  # skip today's old row
+                # Also skip old unix timestamp format rows
+                if line[0].isdigit() and 'T' not in line.split(',')[0]:
+                    continue  # skip old format rows
+                existing_rows.append(line)
 
-        # Build final CSV — replace today's row if exists, otherwise append
-        today_ts_str = str(unix_ts)
-        filtered_rows = [r for r in existing_rows if not r.startswith(today_ts_str + ",")]
-        all_rows = filtered_rows[-29:] + [new_row]
-        csv_content = csv_header + "\n" + "\n".join(all_rows) + "\n"
+            # Keep last 29 rows + new one = 30 total
+            existing_rows = existing_rows[-29:]
+
+        # Build final CSV — NO HEADER
+        all_rows = existing_rows + [new_row]
+        csv_content = "\n".join(all_rows) + "\n"
 
         # Encode to base64
         content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
@@ -168,11 +175,10 @@ def push_dp_to_github(ticker="QQQ", dp_data=None):
     dp4 = top4[3]['strike'] if len(top4) > 3 else 0
 
     now = datetime.now(timezone.utc)
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    unix_ts = int(midnight.timestamp())
+    date_str = now.strftime("%Y%m%dT")
 
-    csv_header = "time,open,high,low,close,volume"
-    new_row = f"{unix_ts},{dp1},{dp2},{dp3},{dp4},{len(levels)}"
+    # NO HEADER — TradingView pine_seeds format: YYYYMMDDT,open,high,low,close,volume
+    new_row = f"{date_str},{dp1},{dp2},{dp3},{dp4},{len(levels)}"
 
     filename = f"{ticker.upper()}_dp"
     filepath = f"data/{filename}.csv"
@@ -194,13 +200,19 @@ def push_dp_to_github(ticker="QQQ", dp_data=None):
             existing_sha = file_data['sha']
             content = base64.b64decode(file_data['content']).decode('utf-8')
             lines = content.strip().split('\n')
-            if len(lines) > 1:
-                existing_rows = lines[1:][-29:]
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('time'):
+                    continue
+                if line.startswith(date_str):
+                    continue
+                if line[0].isdigit() and 'T' not in line.split(',')[0]:
+                    continue
+                existing_rows.append(line)
+            existing_rows = existing_rows[-29:]
 
-        today_ts_str = str(unix_ts)
-        filtered_rows = [r for r in existing_rows if not r.startswith(today_ts_str + ",")]
-        all_rows = filtered_rows[-29:] + [new_row]
-        csv_content = csv_header + "\n" + "\n".join(all_rows) + "\n"
+        all_rows = existing_rows + [new_row]
+        csv_content = "\n".join(all_rows) + "\n"
         content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
 
         payload = {
@@ -218,6 +230,68 @@ def push_dp_to_github(ticker="QQQ", dp_data=None):
 
     except Exception as e:
         logger.error(f"Pine Seeds DP push failed: {e}")
+        return False
+
+
+def ensure_symbol_info():
+    """
+    Ensure symbol_info JSON exists in the repo.
+    TradingView requires this for pine_seeds to work.
+    """
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        return False
+
+    symbol_info = {
+        "QQQ_gex": {
+            "symbol": "QQQ_gex",
+            "description": "BullNet QQQ GEX Levels",
+            "pricescale": 100
+        },
+        "GLD_gex": {
+            "symbol": "GLD_gex",
+            "description": "BullNet GLD GEX Levels",
+            "pricescale": 100
+        },
+        "QQQ_dp": {
+            "symbol": "QQQ_dp",
+            "description": "BullNet QQQ Dark Pool Zones",
+            "pricescale": 100
+        },
+        "GLD_dp": {
+            "symbol": "GLD_dp",
+            "description": "BullNet GLD Dark Pool Zones",
+            "pricescale": 100
+        }
+    }
+
+    filepath = f"symbol_info/{REPO_NAME}.json"
+    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{REPO_NAME}/contents/{filepath}"
+    headers = {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'BullNet-Bot',
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            logger.info("symbol_info already exists")
+            return True
+
+        import json as json_mod
+        content = json_mod.dumps(symbol_info, indent=4)
+        content_b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
+        payload = {
+            'message': 'Add symbol_info for TradingView pine_seeds',
+            'content': content_b64,
+        }
+        resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        logger.info("symbol_info created successfully")
+        return True
+    except Exception as e:
+        logger.error(f"symbol_info push failed: {e}")
         return False
 
 
