@@ -1,374 +1,177 @@
 """
-Barchart GEX Scraper — No Selenium!
-Uses requests.Session to get cookies, then calls internal API.
-Falls back to parsing page text for gamma flip / call wall / put wall.
+Barchart GEX Scraper — Playwright (Headless Chromium)
+Fetches EXACT gamma flip, call wall, put wall from Barchart.
+Values are JS-rendered → needs real browser.
 
-Barchart calculates GEX levels from:
-- ALL contracts (all expirations)
-- Open Interest
-- 1% move
-- End-of-Day data (updated ~8:30pm ET)
+Install on Railway:
+  pip install playwright
+  playwright install --with-deps chromium
 """
 
-import requests
+import asyncio
 import re
 import logging
 import time
 
 logger = logging.getLogger(__name__)
 
-# Barchart page URLs
-BARCHART_PAGE = "https://www.barchart.com/{asset_type}/quotes/{ticker}/gamma-exposure"
+# Cache to avoid hammering Barchart
+_cache = {}  # ticker -> {levels, timestamp}
+CACHE_TTL = 55  # seconds
 
-# Barchart internal API
-BARCHART_API = "https://www.barchart.com/proxies/core-api/v1/options/get"
-
-# ETFs vs stocks
 ETF_TICKERS = {"QQQ", "SPY", "IWM", "DIA", "GLD", "SLV", "TLT", "XLF", "XLE", "VOO"}
 
-# Browser-like headers
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-}
 
-API_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-    'Accept': 'application/json',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-}
+def _get_url(ticker):
+    asset_type = "etfs-funds" if ticker.upper() in ETF_TICKERS else "stocks"
+    return f"https://www.barchart.com/{asset_type}/quotes/{ticker.upper()}/gamma-exposure"
 
 
-def fetch_barchart_gex(ticker="QQQ"):
+async def fetch_barchart_gex_async(ticker="QQQ"):
     """
-    Fetch GEX levels from Barchart.
-    
-    Strategy:
-    1. Open session, GET the gamma-exposure page → get cookies
-    2. Parse page HTML for gamma flip / call wall / put wall text
-    3. If text parsing fails, call internal API with cookies → calculate ourselves
-    
-    Returns: dict with gamma_flip, call_wall, put_wall, spot, source
-             or None on failure
+    Fetch GEX levels from Barchart using Playwright.
+    Returns dict with gamma_flip, call_wall, put_wall, spot, source
+    or None on failure.
     """
     ticker = ticker.upper()
-    asset_type = "etfs-funds" if ticker in ETF_TICKERS else "stocks"
-    page_url = BARCHART_PAGE.format(asset_type=asset_type, ticker=ticker)
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    # Check cache
+    cached = _cache.get(ticker)
+    if cached and (time.time() - cached['timestamp']) < CACHE_TTL:
+        logger.info(f"Barchart cache hit for {ticker} (age: {time.time() - cached['timestamp']:.0f}s)")
+        return cached['levels']
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.error("Playwright not installed! pip install playwright && playwright install --with-deps chromium")
+        return None
 
     levels = {}
 
     try:
-        # ── Step 1: Get page + cookies ──
-        logger.info(f"Barchart: fetching page for {ticker}...")
-        resp = session.get(page_url, timeout=30)
-        resp.raise_for_status()
-        page_text = resp.text
-        logger.info(f"Barchart: page loaded ({len(page_text)} chars)")
-
-        # ── Step 2: Strip HTML tags for cleaner text parsing ──
-        # Barchart may render: "<strong>GLD</strong> gamma flip point is <strong>391.72</strong>"
-        clean_text = re.sub(r'<[^>]+>', ' ', page_text)
-        clean_text = re.sub(r'\s+', ' ', clean_text)
-
-        # Parse gamma flip: "GLD gamma flip point is 391.72"
-        gf_match = re.search(
-            rf'{ticker}\s+gamma\s+flip\s+point\s+is\s+(\d+\.?\d*)',
-            clean_text, re.IGNORECASE
-        )
-        if gf_match:
-            levels['gamma_flip'] = float(gf_match.group(1))
-            logger.info(f"Barchart: Gamma Flip = {levels['gamma_flip']}")
-
-        # "GLD put wall is 450.00"
-        pw_match = re.search(
-            rf'{ticker}\s+put\s+wall\s+is\s+(\d+\.?\d*)',
-            clean_text, re.IGNORECASE
-        )
-        if pw_match:
-            levels['put_wall'] = float(pw_match.group(1))
-            logger.info(f"Barchart: Put Wall = {levels['put_wall']}")
-
-        # "GLD call wall is 475.00"
-        cw_match = re.search(
-            rf'{ticker}\s+call\s+wall\s+is\s+(\d+\.?\d*)',
-            clean_text, re.IGNORECASE
-        )
-        if cw_match:
-            levels['call_wall'] = float(cw_match.group(1))
-            logger.info(f"Barchart: Call Wall = {levels['call_wall']}")
-
-        # Also try JSON embedded in page (Angular data)
-        if 'gamma_flip' not in levels:
-            # Try: "gammaFlipPoint":391.72  or "gamma_flip":391.72
-            gf_json = re.search(r'["\']?gamma[_\s]?[Ff]lip[_\s]?[Pp]oint["\']?\s*[=:]\s*["\']?(\d+\.?\d*)', page_text)
-            if gf_json:
-                levels['gamma_flip'] = float(gf_json.group(1))
-                logger.info(f"Barchart JSON: Gamma Flip = {levels['gamma_flip']}")
-
-        if 'gamma_flip' not in levels:
-            # Try broader: any "gamma flip" near a number
-            gf_broad = re.search(r'gamma\s*flip[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
-            if gf_broad:
-                levels['gamma_flip'] = float(gf_broad.group(1))
-                logger.info(f"Barchart BROAD: Gamma Flip = {levels['gamma_flip']}")
-
-        if 'put_wall' not in levels:
-            pw_broad = re.search(r'put\s*wall[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
-            if pw_broad:
-                levels['put_wall'] = float(pw_broad.group(1))
-                logger.info(f"Barchart BROAD: Put Wall = {levels['put_wall']}")
-
-        if 'call_wall' not in levels:
-            cw_broad = re.search(r'call\s*wall[^0-9]{0,30}(\d{2,4}\.?\d{0,2})', clean_text, re.IGNORECASE)
-            if cw_broad:
-                levels['call_wall'] = float(cw_broad.group(1))
-                logger.info(f"Barchart BROAD: Call Wall = {levels['call_wall']}")
-
-        # Debug: log snippets around key terms if not found
-        if 'gamma_flip' not in levels:
-            for term in ['gamma flip', 'gammaFlip', 'gamma_flip']:
-                idx = clean_text.lower().find(term.lower())
-                if idx >= 0:
-                    snippet = clean_text[idx:idx+120]
-                    logger.info(f"Barchart DEBUG '{term}' at {idx}: {snippet}")
-            # Also check raw HTML
-            for term in ['gamma flip', 'gammaFlip', 'flipPoint']:
-                idx = page_text.lower().find(term.lower())
-                if idx >= 0:
-                    snippet = page_text[idx:idx+200].replace('\n', ' ')
-                    logger.info(f"Barchart RAW '{term}' at {idx}: {snippet}")
-
-        # ── Step 3: If page text worked, we're done ──
-        if 'gamma_flip' in levels:
-            # Try to get spot price
-            spot_match = re.search(
-                r'Last\s*Price[:\s]*\$?(\d+\.?\d*)', page_text, re.IGNORECASE
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--disable-background-networking',
+                    '--no-first-run',
+                ]
             )
-            if not spot_match:
-                spot_match = re.search(
-                    r'"lastPrice":\s*(\d+\.?\d*)', page_text
+
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+            )
+
+            page = await context.new_page()
+            url = _get_url(ticker)
+
+            logger.info(f"Barchart Playwright: loading {ticker}...")
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+
+            # Wait for gamma flip text to appear (JS renders it)
+            try:
+                await page.wait_for_function(
+                    "document.body.innerText.includes('gamma flip point is')",
+                    timeout=20000
                 )
+                logger.info(f"Barchart Playwright: gamma flip text rendered")
+            except Exception:
+                logger.info(f"Barchart Playwright: waiting extra for JS...")
+                await asyncio.sleep(5)
+
+            # Get rendered text (all JS executed)
+            text = await page.evaluate("document.body.innerText")
+            logger.info(f"Barchart Playwright: got {len(text)} chars")
+
+            await browser.close()
+
+            # ── Parse values ──
+            # "GLD gamma flip point is 391.72"
+            gf_match = re.search(
+                rf'{ticker}\s+gamma\s+flip\s+point\s+is\s+(\d+\.?\d*)',
+                text, re.IGNORECASE
+            )
+            if gf_match:
+                levels['gamma_flip'] = float(gf_match.group(1))
+                logger.info(f"Barchart: Gamma Flip = {levels['gamma_flip']}")
+
+            # "GLD put wall is 450.00"
+            pw_match = re.search(
+                rf'{ticker}\s+put\s+wall\s+is\s+(\d+\.?\d*)',
+                text, re.IGNORECASE
+            )
+            if pw_match:
+                levels['put_wall'] = float(pw_match.group(1))
+                logger.info(f"Barchart: Put Wall = {levels['put_wall']}")
+
+            # "GLD call wall is 475.00"
+            cw_match = re.search(
+                rf'{ticker}\s+call\s+wall\s+is\s+(\d+\.?\d*)',
+                text, re.IGNORECASE
+            )
+            if cw_match:
+                levels['call_wall'] = float(cw_match.group(1))
+                logger.info(f"Barchart: Call Wall = {levels['call_wall']}")
+
+            # Spot price
+            spot_match = re.search(r'Last Price\s*\$?([\d,]+\.?\d*)', text)
+            if not spot_match:
+                spot_match = re.search(r'(\d{2,4}\.\d{2})\s+[+-]?\d+\.\d+\s+[+-]?\d+\.\d+%', text)
             if spot_match:
-                levels['spot'] = float(spot_match.group(1))
-
-            # Derive regime
-            if 'spot' in levels:
-                levels['gamma_regime'] = "Positiv" if levels['spot'] > levels['gamma_flip'] else "Negativ"
-            
-            levels['source'] = 'barchart'
-            logger.info(f"Barchart TEXT PARSE SUCCESS: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
-            return levels
-
-        # ── Step 4: Text parse failed — try API with session cookies ──
-        logger.info("Barchart: text parse incomplete, trying API...")
-        api_levels = _fetch_via_api(session, ticker)
-        if api_levels:
-            return api_levels
-
-        # ── Step 5: Nothing worked ──
-        if levels:
-            levels['source'] = 'barchart-partial'
-            return levels
-
-        logger.warning("Barchart: all methods failed")
-        return None
+                levels['spot'] = float(spot_match.group(1).replace(',', ''))
 
     except Exception as e:
-        logger.error(f"Barchart error: {e}")
+        logger.error(f"Barchart Playwright error: {e}")
         return None
 
+    if 'gamma_flip' in levels:
+        if 'spot' in levels:
+            levels['gamma_regime'] = "Positiv" if levels['spot'] > levels['gamma_flip'] else "Negativ"
+        else:
+            levels['gamma_regime'] = "N/A"
+        levels['source'] = 'barchart'
 
-def _fetch_via_api(session, ticker):
-    """
-    Call Barchart internal options API with session cookies.
-    Fetch ALL expirations and calculate GEX ourselves.
-    """
+        # Update cache
+        _cache[ticker] = {'levels': levels, 'timestamp': time.time()}
+
+        logger.info(f"Barchart SUCCESS {ticker}: GF={levels.get('gamma_flip')} "
+                     f"CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
+        return levels
+
+    logger.warning(f"Barchart Playwright: could not parse GEX for {ticker}")
+    return None
+
+
+def fetch_barchart_gex(ticker="QQQ"):
+    """Synchronous wrapper — for non-async callers."""
     try:
-        # Update headers for API call
-        api_session_headers = {
-            'Accept': 'application/json',
-            'Referer': f'https://www.barchart.com/etfs-funds/quotes/{ticker}/gamma-exposure',
-        }
-
-        # Get XSRF token from cookies
-        xsrf = session.cookies.get('XSRF-TOKEN', '')
-        if xsrf:
-            # URL-decode the token
-            import urllib.parse
-            xsrf_decoded = urllib.parse.unquote(xsrf)
-            api_session_headers['x-xsrf-token'] = xsrf_decoded
-
-        params = {
-            'symbols': ticker,
-            'raw': '1',
-            'fields': 'symbol,strikePrice,optionType,baseLastPrice,dailyGamma,gamma,dailyOpenInterest,openInterest,daysToExpiration,expirationDate',
-            'groupBy': 'strikePrice',
-        }
-
-        logger.info(f"Barchart API: fetching options for {ticker}...")
-        resp = session.get(BARCHART_API, params=params, headers=api_session_headers, timeout=30)
-
-        if resp.status_code != 200:
-            logger.warning(f"Barchart API: status {resp.status_code}")
-            return None
-
-        data = resp.json()
-
-        # Data structure depends on groupBy:
-        # With groupBy=strikePrice: {"data": {"250.00": [...], "255.00": [...]}}
-        # Without groupBy: {"data": [...]}
-        raw_data = data.get('data', {})
-        
-        if isinstance(raw_data, dict):
-            # groupBy response — flatten all strike groups
-            all_records = []
-            for strike_key, options_list in raw_data.items():
-                if isinstance(options_list, list):
-                    all_records.extend(options_list)
-                else:
-                    all_records.append(options_list)
-            raw_data = all_records
-        elif isinstance(raw_data, list):
-            pass  # already a flat list
-        else:
-            logger.warning(f"Barchart API: unexpected data type: {type(raw_data)}")
-            return None
-
-        if not raw_data:
-            logger.warning("Barchart API: no data returned")
-            return None
-
-        logger.info(f"Barchart API: got {len(raw_data)} records")
-
-        # Parse and calculate GEX
-        return _calculate_gex_from_barchart(raw_data, ticker)
-
-    except Exception as e:
-        logger.error(f"Barchart API error: {e}")
-        return None
-
-
-def _calculate_gex_from_barchart(raw_data, ticker):
-    """
-    Calculate Gamma Flip, Call Wall, Put Wall from Barchart options data.
-    Uses same formula as Barchart:
-    GEX = Gamma × Open Interest × Spot² × 0.01
-    (per 1% move)
-    """
-    import numpy as np
-
-    spot = 0
-    strikes_data = {}  # strike -> {call_gex, put_gex, net_gex}
-
-    for item in raw_data:
-        if isinstance(item, str):
-            continue  # skip string keys
-        raw = item.get('raw', item) if isinstance(item, dict) else {}
-        if not isinstance(raw, dict):
-            continue
-
-        strike = float(raw.get('strikePrice', 0) or 0)
-        opt_type = raw.get('optionType', '').lower()
-        gamma = float(raw.get('dailyGamma', 0) or raw.get('gamma', 0) or 0)
-        oi = int(raw.get('dailyOpenInterest', 0) or raw.get('openInterest', 0) or 0)
-        base_price = float(raw.get('baseLastPrice', 0) or raw.get('baseDailyLastPrice', 0) or 0)
-
-        if base_price > 0:
-            spot = base_price
-
-        if strike <= 0 or gamma <= 0 or oi <= 0:
-            continue
-
-        # GEX per 1% move: Gamma * OI * 100 * Spot * Spot * 0.01
-        gex = gamma * oi * 100 * spot * spot * 0.01
-
-        # Dealer GEX: calls positive, puts negative
-        if 'call' in opt_type:
-            dealer_gex = gex
-        else:
-            dealer_gex = -gex
-
-        if strike not in strikes_data:
-            strikes_data[strike] = {'call_gex': 0, 'put_gex': 0, 'net_gex': 0}
-
-        if 'call' in opt_type:
-            strikes_data[strike]['call_gex'] += dealer_gex
-        else:
-            strikes_data[strike]['put_gex'] += dealer_gex
-        strikes_data[strike]['net_gex'] += dealer_gex
-
-    if not strikes_data or spot <= 0:
-        logger.warning("Barchart calc: insufficient data")
-        return None
-
-    # Sort by strike
-    sorted_strikes = sorted(strikes_data.keys())
-    net_gex_values = [strikes_data[s]['net_gex'] for s in sorted_strikes]
-
-    # Find Gamma Flip (where net GEX crosses zero)
-    gamma_flip = None
-    min_dist = float('inf')
-    for i in range(len(net_gex_values) - 1):
-        if net_gex_values[i] * net_gex_values[i + 1] < 0:
-            # Linear interpolation
-            ratio = abs(net_gex_values[i]) / (abs(net_gex_values[i]) + abs(net_gex_values[i + 1]))
-            fp = sorted_strikes[i] + ratio * (sorted_strikes[i + 1] - sorted_strikes[i])
-            dist = abs(fp - spot)
-            if dist < min_dist:
-                min_dist = dist
-                gamma_flip = fp
-
-    # Find Call Wall (strike with highest positive call GEX)
-    call_wall = None
-    max_call_gex = 0
-    for s in sorted_strikes:
-        if strikes_data[s]['call_gex'] > max_call_gex:
-            max_call_gex = strikes_data[s]['call_gex']
-            call_wall = s
-
-    # Find Put Wall (strike with most negative put GEX)
-    put_wall = None
-    min_put_gex = 0
-    for s in sorted_strikes:
-        if strikes_data[s]['put_gex'] < min_put_gex:
-            min_put_gex = strikes_data[s]['put_gex']
-            put_wall = s
-
-    levels = {
-        'spot': spot,
-        'source': 'barchart-api',
-    }
-
-    if gamma_flip is not None:
-        levels['gamma_flip'] = round(gamma_flip, 2)
-        levels['gamma_regime'] = "Positiv" if spot > gamma_flip else "Negativ"
-    if call_wall is not None:
-        levels['call_wall'] = call_wall
-    if put_wall is not None:
-        levels['put_wall'] = put_wall
-
-    logger.info(f"Barchart CALC: GF={levels.get('gamma_flip')} CW={call_wall} PW={put_wall} Spot={spot}")
-    return levels
+        return asyncio.run(fetch_barchart_gex_async(ticker))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(fetch_barchart_gex_async(ticker))
+        loop.close()
+        return result
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    
-    for t in ["QQQ", "GLD"]:
-        print(f"\n{'='*40}")
-        print(f"  {t} GEX from Barchart")
-        print(f"{'='*40}")
-        result = fetch_barchart_gex(t)
-        if result:
-            for k, v in result.items():
-                print(f"  {k}: {v}")
-        else:
-            print("  FAILED")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+    async def test():
+        for t in ["QQQ", "GLD"]:
+            print(f"\n{'='*40}")
+            print(f"  {t} GEX from Barchart (Playwright)")
+            print(f"{'='*40}")
+            result = await fetch_barchart_gex_async(t)
+            if result:
+                for k, v in result.items():
+                    print(f"  {k}: {v}")
+            else:
+                print("  FAILED")
+
+    asyncio.run(test())
