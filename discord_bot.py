@@ -72,14 +72,56 @@ async def get_gex_report(ticker="QQQ", ratio=None):
     if is_gold:
         ticker = "GLD"
     r = ratio or (GOLD_RATIO if is_gold else RATIO)
+    
+    spot = None
+    levels = None
+    gex_df = None
+    
+    # ── 1. Try Barchart Playwright (exact values) ──
     try:
-        spot, levels, gex_df = await asyncio.to_thread(run_gex, ticker, r)
+        from barchart_gex import fetch_barchart_gex_async
+        logger.info(f"Trying Barchart Playwright for {ticker}...")
+        bc_levels = await fetch_barchart_gex_async(ticker)
+        if bc_levels and 'gamma_flip' in bc_levels:
+            spot = bc_levels.get('spot', 0)
+            levels = bc_levels
+            logger.info(f"Barchart Playwright SUCCESS: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
+            
+            # Get HVL from CBOE if missing
+            if 'hvl' not in levels:
+                try:
+                    from gex_calculator import fetch_cboe_options, parse_options, calculate_gex, find_key_levels
+                    cboe_spot, options = await asyncio.to_thread(fetch_cboe_options, ticker)
+                    if options:
+                        df = parse_options(cboe_spot or spot, options)
+                        if not df.empty:
+                            gex_result = calculate_gex(cboe_spot or spot, df)
+                            cboe_levels = find_key_levels(cboe_spot or spot, gex_result)
+                            if 'hvl' in cboe_levels:
+                                levels['hvl'] = cboe_levels['hvl']
+                            if not spot or spot == 0:
+                                spot = cboe_spot
+                                levels['spot'] = spot
+                except Exception as e:
+                    logger.warning(f"CBOE HVL supplement failed: {e}")
+        else:
+            logger.info("Barchart Playwright returned no gamma_flip, falling back...")
+            levels = None
     except Exception as e:
-        logger.error(f"GEX error: {e}")
-        logger.error(traceback.format_exc())
-        return None, None, str(e) + "\n" + traceback.format_exc()[-500:]
+        logger.warning(f"Barchart Playwright failed: {e}, falling back to API/CBOE")
+
+    # ── 2. Fallback: Barchart API + CBOE (sync in thread) ──
+    if not levels or 'gamma_flip' not in levels:
+        try:
+            spot, levels, gex_df = await asyncio.to_thread(run_gex, ticker, r)
+        except Exception as e:
+            logger.error(f"GEX error: {e}")
+            logger.error(traceback.format_exc())
+            return None, None, str(e) + "\n" + traceback.format_exc()[-500:]
+    
     if not levels:
         return None, None, "Levels leer - keine Daten berechnet"
+    
     text_msg = format_discord_message(spot, levels, r, ticker)
     gf = levels.get('gamma_flip', 0)
     cw = levels.get('call_wall', 0)
