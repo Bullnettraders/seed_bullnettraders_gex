@@ -25,8 +25,15 @@ EXCHANGE_MAP = {
 }
 
 
+def _normalize(ticker):
+    """Normalize ticker aliases."""
+    aliases = {'GOLD': 'GLD', 'SILVER': 'SLV'}
+    return aliases.get(ticker.upper(), ticker.upper())
+
+
 def _get_urls(ticker):
     """Returns list of URLs to try, in order."""
+    ticker = _normalize(ticker)
     exchanges = EXCHANGE_MAP.get(ticker.upper(), ['nasdaq', 'nyse'])
     return [
         f"https://chartexchange.com/symbol/{ex}-{ticker.lower()}/exchange-volume/dark-pool-prints/"
@@ -35,7 +42,7 @@ def _get_urls(ticker):
 
 
 async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
-    ticker = ticker.upper()
+    ticker = _normalize(ticker.upper())
 
     cached = _cache.get(ticker)
     if cached and (time.time() - cached['timestamp']) < CACHE_TTL:
