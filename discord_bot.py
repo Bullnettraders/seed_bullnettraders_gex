@@ -226,6 +226,18 @@ async def _push_dp_to_tradingview(ticker, dp, spot):
 # ═══════════════════════════════════════════════════════════
 
 @tasks.loop(minutes=30)
+async def _push_bt_to_tradingview(ticker, prints_data):
+    """Helper: Block Trades nach GitHub/TradingView pushen."""
+    try:
+        from pine_seeds import push_bt_to_github
+        bt_ticker = "GLD" if ticker.upper() in ("GLD", "GOLD") else ticker.upper()
+        ok = push_bt_to_github(bt_ticker, prints_data)
+        if ok:
+            logger.info(f"BT TradingView push OK {bt_ticker}")
+    except Exception as e:
+        logger.warning(f"BT TradingView push failed: {e}")
+
+
 async def auto_push_tradingview():
     """
     Alle 30 Minuten automatisch:
@@ -592,6 +604,9 @@ async def cmd_prints(ctx, ticker: str = "QQQ"):
     if len(msg) > 1950:
         msg = msg[:1950] + "\n```"
     await ctx.send(msg)
+
+    # Auto-push Block Trades to TradingView
+    asyncio.create_task(_push_bt_to_tradingview(ticker, prints))
 
 
 @bot.command(name='dpmem')
