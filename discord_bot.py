@@ -71,16 +71,23 @@ def auto_update_ratios():
             return
 
         xau_price = None
-        # GC=F: Yahoo Futures-Preis — divide by 1 (ist in USD/oz wie XAUUSD)
-        # Aber GC=F kann falschen Kontrakt geben → prüfe Plausibilität
-        for symbol in ['GC%3DF', 'XAUUSD%3DX', 'SI%3DF']:
+        # Yahoo Finance Bug: GC=F liefert manchmal ~2x den echten Goldpreis
+        # Echtes Gold: ~2900-3200 USD/oz. Yahoo GC=F gibt ~5000-6400 → halbieren.
+        for symbol in ['GC%3DF', 'XAUUSD%3DX']:
             price = _yahoo_price(symbol, headers)
-            if price and 2000 < price < 5000:  # Plausibel für XAUUSD (2000-5000 USD/oz)
+            if not price:
+                logger.warning(f"Gold symbol {symbol}: kein Wert von Yahoo")
+                continue
+            # Korrigiere Yahoo-Doppelwert (bekannter Bug bei GC=F)
+            if 4000 < price < 7000:
+                price = round(price / 2, 2)
+                logger.info(f"Gold symbol {symbol}: Yahoo-Doppelwert erkannt, halbiert -> {price}")
+            if 2000 < price < 4000:
                 xau_price = price
                 logger.info(f"Gold Spot via {symbol}: {xau_price}")
                 break
-            elif price:
-                logger.warning(f"Gold symbol {symbol}: {price} ausserhalb Plausibilitaet (2000-5000)")
+            else:
+                logger.warning(f"Gold symbol {symbol}: {price} nicht plausibel (2000-4000), skip")
 
         if gld_price and xau_price:
             new_gold = round(xau_price / gld_price, 4)
@@ -755,18 +762,33 @@ async def cmd_test(ctx):
 
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        GOLD_SYMBOLS = {'GC%3DF': 'GC=F', 'XAUUSD%3DX': 'XAUUSD=X'}
         gld = _yahoo_price('GLD', headers)
-        results = []
-        for sym, label in GOLD_SYMBOLS.items():
-            price = _yahoo_price(sym, headers)
-            plausible = "✅" if price and 2000 < price < 5000 else "❌"
-            ratio = round(price / gld, 4) if price and gld else "N/A"
-            results.append(f"{plausible} {label}: {price} → Ratio: {ratio}")
-        lines = [f"GLD Spot: "] + results + [f"Aktiver GOLD_RATIO: **{GOLD_RATIO:.4f}**"]
-        await ctx.send("")
+        gc_raw = _yahoo_price('GC%3DF', headers)
+        xau_raw = _yahoo_price('XAUUSD%3DX', headers)
+        gc_fixed = round(gc_raw / 2, 2) if gc_raw and gc_raw > 4000 else gc_raw
+        msg_lines = [
+            f"GLD Spot:     ${gld}",
+            f"GC=F raw:     ${gc_raw}  ->  korrigiert: ${gc_fixed}",
+            f"XAUUSD=X:     ${xau_raw}",
+            "",
+        ]
+        if gld and gc_fixed and 2000 < gc_fixed < 4000:
+            r = round(gc_fixed / gld, 4)
+            ok = "OK" if 5 < r < 8 else "!!"
+            msg_lines.append(f"[{ok}] GC=F Ratio:   {gc_fixed} / {gld} = {r}")
+        if gld and xau_raw and 2000 < xau_raw < 4000:
+            r = round(xau_raw / gld, 4)
+            ok = "OK" if 5 < r < 8 else "!!"
+            msg_lines.append(f"[{ok}] XAUUSD Ratio: {xau_raw} / {gld} = {r}")
+        msg_lines += [
+            "",
+            f"Aktiver GOLD_RATIO: {GOLD_RATIO:.4f}",
+            f"Beispiel: GLD $460 x {GOLD_RATIO:.4f} = {int(460*GOLD_RATIO)} XAUUSD",
+        ]
+        sep = chr(10)
+        await ctx.send("```" + sep + sep.join(msg_lines) + sep + "```")
     except Exception as e:
-        await ctx.send(f"Ratio Test Fehler: {e}")
+        await ctx.send(f'Ratio Test Fehler: {e}')
 
 
 @bot.command(name='hilfe')
