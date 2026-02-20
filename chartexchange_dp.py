@@ -18,21 +18,36 @@ _cache = {}  # ticker -> {levels, timestamp}
 CACHE_TTL = 300  # 5 minutes
 
 # ✅ FIX: GLD/SLV/SPY/IWM sind alle NYSE Arca (ETFs!)
+# Primary exchange per ticker
 EXCHANGE_MAP = {
     'QQQ': 'nasdaq',
-    'SPY': 'nyse_arca',   # ✅ war 'nyse'
-    'IWM': 'nyse_arca',   # ✅ war 'nyse'
-    'GLD': 'nyse_arca',   # ✅ FIX: war 'nyse' → jetzt 'nyse_arca'
-    'SLV': 'nyse_arca',   # ✅ war 'nyse'
+    'SPY': 'nyse_arca',
+    'IWM': 'nyse_arca',
+    'GLD': 'amex',        # ✅ amex funktioniert, nyse_arca gibt 404
+    'SLV': 'amex',
     'AAPL': 'nasdaq', 'MSFT': 'nasdaq', 'AMZN': 'nasdaq',
     'NVDA': 'nasdaq', 'TSLA': 'nasdaq', 'META': 'nasdaq',
     'AMD': 'nasdaq', 'GOOGL': 'nasdaq',
 }
 
+# Fallback-Kette falls primary 404 gibt
+EXCHANGE_FALLBACKS = {
+    'GLD': ['amex', 'nyse_arca', 'nyse'],
+    'SLV': ['amex', 'nyse_arca', 'nyse'],
+    'SPY': ['nyse_arca', 'nyse'],
+    'IWM': ['nyse_arca', 'nyse'],
+}
 
-def _get_url(ticker):
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nasdaq')
-    return f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/"
+
+def _get_urls(ticker):
+    """Returns list of URLs to try in order."""
+    exchanges = EXCHANGE_FALLBACKS.get(ticker.upper())
+    if not exchanges:
+        exchanges = [EXCHANGE_MAP.get(ticker.upper(), 'nasdaq')]
+    return [
+        f"https://chartexchange.com/symbol/{ex}-{ticker.lower()}/exchange-volume/"
+        for ex in exchanges
+    ]
 
 
 async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
@@ -77,25 +92,37 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
             )
 
             page = await context.new_page()
-            url = _get_url(ticker)
+            urls_to_try = _get_urls(ticker)
+            rows = []
 
-            logger.info(f"ChartExchange Playwright: loading {ticker} DP... URL={url}")
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # Try each URL until one works
+            for url in urls_to_try:
+                logger.info(f"ChartExchange Playwright: trying {ticker} DP URL={url}")
+                await page.goto(url, wait_until='networkidle', timeout=45000)
+                await asyncio.sleep(3)
 
-            # Wait for Dark Pool Levels table to render
-            try:
-                await page.wait_for_selector(
-                    '#darkpoollevels table tbody tr, [id*="darkpool"] table tbody tr',
-                    timeout=15000
-                )
-                logger.info(f"ChartExchange Playwright: DP table found")
-            except Exception:
-                logger.info(f"ChartExchange Playwright: waiting for JS render...")
-                await asyncio.sleep(5)
+                title = await page.title()
+                logger.info(f"ChartExchange DP: page title = '{title}'")
 
-            # Scroll to dark pool section to trigger lazy loading
-            await page.evaluate("document.querySelector('#darkpoollevels')?.scrollIntoView()")
-            await asyncio.sleep(2)
+                if '404' in title or 'not found' in title.lower():
+                    logger.warning(f"ChartExchange DP: 404 at {url}, trying next...")
+                    continue
+
+                # Wait for Dark Pool Levels table
+                try:
+                    await page.wait_for_selector(
+                        '#darkpoollevels table tbody tr, [id*="darkpool"] table tbody tr, table tbody tr',
+                        timeout=20000
+                    )
+                    logger.info(f"ChartExchange DP: table found at {url}")
+                except Exception:
+                    logger.warning(f"ChartExchange DP: no table at {url}, trying next...")
+                    continue
+
+                # Scroll to dark pool section
+                await page.evaluate("document.querySelector('#darkpoollevels')?.scrollIntoView()")
+                await asyncio.sleep(2)
+                break  # Valid page found — extract below
 
             # Try extracting from DataTable via JS
             rows = await page.evaluate("""() => {
