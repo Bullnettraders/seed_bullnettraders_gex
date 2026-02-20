@@ -563,9 +563,15 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
         result['source'] = 'chartexchange'
 
         # Filter: only keep levels within ±20% of spot (sanity check)
-        if spot and spot > 0:
-            levels_data = [l for l in levels_data if abs(l['price'] - spot) / spot < 0.20]
-            logger.info(f"After spot filter (±20% of {spot}): {len(levels_data)} levels remain")
+        # For GLD/SLV: CBOE spot is wrong (~58) — use median of fetched levels instead
+        etf_spot = spot
+        if ticker in ('GLD', 'SLV') and levels_data:
+            prices = sorted([l['price'] for l in levels_data])
+            etf_spot = prices[len(prices) // 2]  # median of DP levels
+            logger.info(f"GLD/SLV: using median DP price as spot reference: {etf_spot:.2f}")
+        if etf_spot and etf_spot > 0:
+            levels_data = [l for l in levels_data if abs(l['price'] - etf_spot) / etf_spot < 0.20]
+            logger.info(f"After spot filter (±20% of {etf_spot:.2f}): {len(levels_data)} levels remain")
 
         # Cluster nearby levels into zones
         clustered = _cluster_dp_levels(levels_data, threshold_pct=0.15)
