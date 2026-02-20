@@ -14,14 +14,18 @@ logger = logging.getLogger(__name__)
 _cache = {}
 CACHE_TTL = 600  # 10 min
 
+# ✅ FIX: GLD/SLV/SPY/IWM sind NYSE Arca (ETFs!) — war 'nyse'
 EXCHANGE_MAP = {
-    'QQQ': 'nasdaq', 'SPY': 'nyse', 'IWM': 'nyse',
-    'GLD': 'nyse', 'SLV': 'nyse',
+    'QQQ': 'nasdaq',
+    'SPY': 'nyse_arca',   # ✅ Fix
+    'IWM': 'nyse_arca',   # ✅ Fix
+    'GLD': 'nyse_arca',   # ✅ FIX: war 'nyse' → jetzt 'nyse_arca'
+    'SLV': 'nyse_arca',   # ✅ Fix
 }
 
 
 def _get_url(ticker):
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nasdaq')
     return f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/dark-pool-prints/"
 
 
@@ -67,7 +71,7 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
             page = await context.new_page()
             url = _get_url(ticker)
 
-            logger.info(f"DP Prints Playwright: loading {ticker}...")
+            logger.info(f"DP Prints Playwright: loading {ticker}... URL={url}")
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
 
             # Wait for table to render
@@ -83,19 +87,14 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
 
             # Sort by Size descending — click Size header
             try:
-                # Find the Size column header and click to sort
                 await page.evaluate("""() => {
                     const tables = document.querySelectorAll('table');
                     for (const table of tables) {
                         const headers = table.querySelectorAll('thead th');
                         for (const th of headers) {
-                            if (th.textContent.trim().toLowerCase() === 'size' || 
-                                th.textContent.trim().toLowerCase() === 'premium') {
-                                // Premium is default sort, Size is what we want
-                                if (th.textContent.trim().toLowerCase() === 'size') {
-                                    th.click();
-                                    break;
-                                }
+                            if (th.textContent.trim().toLowerCase() === 'size') {
+                                th.click();
+                                break;
                             }
                         }
                     }
@@ -156,7 +155,7 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
                     exchange = row.get('exchange', '').strip()
                     premium_str = row.get('premium', '')
 
-                    # Parse premium (e.g., "484.05M" or "62.01M")
+                    # Parse premium (e.g., "114.30M" or "68.34M")
                     premium = 0
                     pm = re.match(r'([\d.]+)\s*([MKB]?)', premium_str)
                     if pm:
@@ -212,10 +211,10 @@ def fetch_prints_sync(ticker="QQQ", min_size=100000, max_prints=15):
         return result
 
 
-def format_prints_discord(prints, ticker="QQQ", ratio=41.33):
+def format_prints_discord(prints, ticker="QQQ", ratio=6.37):
     """Format prints for Discord."""
     is_gold = ticker.upper() in ("GLD", "GOLD")
-    etf_label = "GLD" if is_gold else "QQQ"
+    etf_label = "GLD" if is_gold else ticker.upper()
     cfd_label = "XAUUSD" if is_gold else "NAS100 CFD"
     title = "BullNet Block Trades - GOLD" if is_gold else f"BullNet Block Trades - {ticker.upper()}"
 
@@ -241,7 +240,7 @@ def format_prints_discord(prints, ticker="QQQ", ratio=41.33):
     lines.append(f"```")
     lines.append(title)
     lines.append("=" * 44)
-    lines.append(f"  Top Block Trades (>{100}K Shares)")
+    lines.append(f"  Top Block Trades (>{100 if not is_gold else 5}K Shares)")
     lines.append(f"  Bid: {bid_count} ({bid_vol:,}) | Ask: {ask_count} ({ask_vol:,}) | Mid: {mid_count}")
     lines.append(f"  Block Trade Bias: {bias}")
     lines.append("")
@@ -262,7 +261,7 @@ def format_prints_discord(prints, ticker="QQQ", ratio=41.33):
 
     lines.append("=" * 44)
     lines.append(f"  Ratio: {ratio:.4f} | Daten: Vortag (T+1)")
-    lines.append(f"  → !dp {ticker} fuer Buy/Sell Zonen im Indikator")
+    lines.append(f"  → !dp {ticker} fuer DP Zonen im Indikator")
     lines.append(f"```")
 
     return "\n".join(lines)
@@ -276,7 +275,7 @@ if __name__ == "__main__":
             print(f"\n{'='*40}")
             print(f"  {t} Dark Pool Prints (Playwright)")
             print(f"{'='*40}")
-            result = await fetch_prints_playwright(t, min_size=100000)
+            result = await fetch_prints_playwright(t, min_size=5000 if t == "GLD" else 100000)
             if result:
                 for i, p in enumerate(result[:10], 1):
                     side_icon = "BUY" if 'bid' in p['side'].lower() else "SELL" if 'ask' in p['side'].lower() else "MID"
