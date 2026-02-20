@@ -39,8 +39,15 @@ EXCHANGE_FALLBACKS = {
 }
 
 
+def _normalize(ticker):
+    """Normalize ticker aliases → canonical ChartExchange ticker."""
+    aliases = {'GOLD': 'GLD', 'SILVER': 'SLV', 'NASDAQ': 'QQQ'}
+    return aliases.get(ticker.upper(), ticker.upper())
+
+
 def _get_urls(ticker):
     """Returns list of URLs to try in order."""
+    ticker = _normalize(ticker)
     exchanges = EXCHANGE_FALLBACKS.get(ticker.upper())
     if not exchanges:
         exchanges = [EXCHANGE_MAP.get(ticker.upper(), 'nasdaq')]
@@ -56,7 +63,7 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
     Returns list of {'price': float, 'volume': int, 'trades': int}
     or empty list on failure.
     """
-    ticker = ticker.upper()
+    ticker = _normalize(ticker.upper())
 
     # Check cache
     cached = _cache.get(ticker)
