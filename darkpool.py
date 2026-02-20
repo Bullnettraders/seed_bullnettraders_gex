@@ -525,6 +525,10 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     3. Options-derived fallback
     Always includes FINRA short volume.
     """
+    # Normalize aliases → canonical ticker
+    _aliases = {'GOLD': 'GLD', 'SILVER': 'SLV'}
+    ticker = _aliases.get(ticker.upper(), ticker.upper())
+
     result = {
         'ticker': ticker,
         'timestamp': datetime.now().isoformat(),
