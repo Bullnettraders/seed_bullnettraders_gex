@@ -19,14 +19,16 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv('DISCORD_TOKEN', '')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 RATIO = float(os.getenv('QQQ_CFD_RATIO', '41.33'))
-GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '6.37'))   # ✅ Default korrigiert (war 10.97)
+GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '10.97'))   # ✅ Default korrigiert (war 10.97)
 SCHEDULE_ENABLED = os.getenv('SCHEDULE_ENABLED', 'true').lower() == 'true'
 SCHEDULE_HOURS = [14, 17, 20]
 
 
-def _yahoo_price(ticker, headers, timeout=10):
+def _yahoo_price(ticker, headers=None, timeout=10):
     """Fetch regularMarketPrice from Yahoo Finance. Returns None on failure."""
     import requests as req
+    if headers is None:
+        headers = {'User-Agent': 'Mozilla/5.0'}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
     try:
         r = req.get(url, headers=headers, timeout=timeout)
@@ -40,10 +42,30 @@ def _yahoo_price(ticker, headers, timeout=10):
     return None
 
 
+def _get_broker_gold():
+    """
+    Fetch Gold price as quoted by Eightcap / Yahoo GC=F.
+    GC=F auf Yahoo = ~5022-5040 = identisch mit Eightcap XAUUSD CFD.
+    Returns float oder None.
+    """
+    import requests as req
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        price = _yahoo_price('GC%3DF', headers)  # GC=F
+        if price and 4000 < price < 7000:
+            logger.info(f"Broker Gold (GC=F): {price}")
+            return float(price)
+    except Exception as e:
+        logger.warning(f"GC=F failed: {e}")
+    return None
+
+
 def auto_update_ratios():
     """
     Auto-calculate ratios from live market data.
-    Gold: probiert mehrere Yahoo-Symbole als Fallback.
+    NAS/QQQ : Yahoo NQ=F / QQQ  → Sanity 30-55
+    XAUUSD/GLD: Yahoo GC=F / GLD → Sanity 8-15
+    GC=F passt zu Eightcap Gold CFD (~5022 = ~10.92x GLD).
     """
     global RATIO, GOLD_RATIO
     import requests as req
@@ -52,7 +74,7 @@ def auto_update_ratios():
     # ── NAS/QQQ Ratio ──
     try:
         qqq_price = _yahoo_price('QQQ', headers)
-        nas_price = _yahoo_price('NQ%3DF', headers)  # NQ=F
+        nas_price = _yahoo_price('NQ%3DF', headers)
         if qqq_price and nas_price:
             new_ratio = round(nas_price / qqq_price, 2)
             if 30 < new_ratio < 55:
@@ -61,43 +83,21 @@ def auto_update_ratios():
     except Exception as e:
         logger.warning(f"NAS ratio failed: {e}")
 
-    # ── XAUUSD/GLD Ratio ──
-    # Yahoo Finance Symbole für Gold Spot (Fallback-Kette)
-    GOLD_SYMBOLS = ['GC%3DF', 'XAUUSD%3DX', 'GLD']  # GC=F, XAUUSD=X
+    # ── XAUUSD(Eightcap)/GLD Ratio ──
     try:
         gld_price = _yahoo_price('GLD', headers)
-        if not gld_price:
-            logger.warning("GLD price not available")
-            return
+        gold_price = _get_broker_gold()
 
-        xau_price = None
-        # Yahoo Finance Bug: GC=F liefert manchmal ~2x den echten Goldpreis
-        # Echtes Gold: ~2900-3200 USD/oz. Yahoo GC=F gibt ~5000-6400 → halbieren.
-        for symbol in ['GC%3DF', 'XAUUSD%3DX']:
-            price = _yahoo_price(symbol, headers)
-            if not price:
-                logger.warning(f"Gold symbol {symbol}: kein Wert von Yahoo")
-                continue
-            # Korrigiere Yahoo-Doppelwert (bekannter Bug bei GC=F)
-            if 4000 < price < 7000:
-                price = round(price / 2, 2)
-                logger.info(f"Gold symbol {symbol}: Yahoo-Doppelwert erkannt, halbiert -> {price}")
-            if 2000 < price < 4000:
-                xau_price = price
-                logger.info(f"Gold Spot via {symbol}: {xau_price}")
-                break
-            else:
-                logger.warning(f"Gold symbol {symbol}: {price} nicht plausibel (2000-4000), skip")
-
-        if gld_price and xau_price:
-            new_gold = round(xau_price / gld_price, 4)
-            if 5.0 < new_gold < 8.0:
+        if gld_price and gold_price:
+            new_gold = round(gold_price / gld_price, 4)
+            # Eightcap Gold ~5022 / GLD ~460 = ~10.92 → Sanity 8-15
+            if 8.0 < new_gold < 15.0:
                 GOLD_RATIO = new_gold
-                logger.info(f"Auto-Ratio XAUUSD/GLD: {GOLD_RATIO} (XAUUSD={xau_price}, GLD={gld_price})")
+                logger.info(f"Auto-Ratio Gold/GLD: {GOLD_RATIO} (Gold={gold_price}, GLD={gld_price})")
             else:
-                logger.warning(f"Gold Ratio {new_gold} ausserhalb 5-8, behalte {GOLD_RATIO}")
+                logger.warning(f"Gold Ratio {new_gold} ausserhalb 8-15, behalte {GOLD_RATIO}")
         else:
-            logger.warning(f"Kein gueltiger Gold Spot Preis gefunden, behalte {GOLD_RATIO}")
+            logger.warning(f"Kein Gold Ratio moeglich (GLD={gld_price}, Gold={gold_price}), behalte {GOLD_RATIO}")
     except Exception as e:
         logger.warning(f"Gold ratio failed: {e}")
 
@@ -763,29 +763,19 @@ async def cmd_test(ctx):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         gld = _yahoo_price('GLD', headers)
-        gc_raw = _yahoo_price('GC%3DF', headers)
-        xau_raw = _yahoo_price('XAUUSD%3DX', headers)
-        gc_fixed = round(gc_raw / 2, 2) if gc_raw and gc_raw > 4000 else gc_raw
-        msg_lines = [
-            f"GLD Spot:     ${gld}",
-            f"GC=F raw:     ${gc_raw}  ->  korrigiert: ${gc_fixed}",
-            f"XAUUSD=X:     ${xau_raw}",
-            "",
-        ]
-        if gld and gc_fixed and 2000 < gc_fixed < 4000:
-            r = round(gc_fixed / gld, 4)
-            ok = "OK" if 5 < r < 8 else "!!"
-            msg_lines.append(f"[{ok}] GC=F Ratio:   {gc_fixed} / {gld} = {r}")
-        if gld and xau_raw and 2000 < xau_raw < 4000:
-            r = round(xau_raw / gld, 4)
-            ok = "OK" if 5 < r < 8 else "!!"
-            msg_lines.append(f"[{ok}] XAUUSD Ratio: {xau_raw} / {gld} = {r}")
-        msg_lines += [
-            "",
-            f"Aktiver GOLD_RATIO: {GOLD_RATIO:.4f}",
-            f"Beispiel: GLD $460 x {GOLD_RATIO:.4f} = {int(460*GOLD_RATIO)} XAUUSD",
-        ]
+        gold = _get_broker_gold()
+        ratio_calc = round(gold / gld, 4) if gld and gold else None
+        ok = "[OK]" if ratio_calc and 8 < ratio_calc < 15 else "[!!]"
         sep = chr(10)
+        msg_lines = [
+            f"GLD Spot:         ${gld}",
+            f"Eightcap Gold:    ${gold}  (Yahoo GC=F)",
+            "",
+            f"{ok} Berechneter Ratio: {ratio_calc}",
+            f"   Aktiver GOLD_RATIO: {GOLD_RATIO:.4f}",
+            "",
+            f"Beispiel: GLD ${int(gld) if gld else 460} x {GOLD_RATIO:.4f} = {int(gld * GOLD_RATIO) if gld else int(460*GOLD_RATIO)}",
+        ]
         await ctx.send("```" + sep + sep.join(msg_lines) + sep + "```")
     except Exception as e:
         await ctx.send(f'Ratio Test Fehler: {e}')
