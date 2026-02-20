@@ -72,18 +72,19 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
             url = _get_url(ticker)
 
             logger.info(f"DP Prints Playwright: loading {ticker}... URL={url}")
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=45000)
+            await asyncio.sleep(3)  # extra buffer for JS DataTable
 
             # Wait for table to render
             try:
                 await page.wait_for_selector(
                     'table tbody tr',
-                    timeout=15000
+                    timeout=20000
                 )
                 logger.info(f"DP Prints: table found")
             except Exception:
                 logger.info(f"DP Prints: waiting for JS render...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(8)
 
             # Sort by Size descending — click Size header
             try:
