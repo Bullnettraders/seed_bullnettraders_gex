@@ -17,9 +17,13 @@ logger = logging.getLogger(__name__)
 _cache = {}  # ticker -> {levels, timestamp}
 CACHE_TTL = 300  # 5 minutes
 
+# ✅ FIX: GLD/SLV/SPY/IWM sind alle NYSE Arca (ETFs!)
 EXCHANGE_MAP = {
-    'QQQ': 'nasdaq', 'SPY': 'nyse', 'IWM': 'nyse',
-    'GLD': 'nyse', 'SLV': 'nyse',
+    'QQQ': 'nasdaq',
+    'SPY': 'nyse_arca',   # ✅ war 'nyse'
+    'IWM': 'nyse_arca',   # ✅ war 'nyse'
+    'GLD': 'nyse_arca',   # ✅ FIX: war 'nyse' → jetzt 'nyse_arca'
+    'SLV': 'nyse_arca',   # ✅ war 'nyse'
     'AAPL': 'nasdaq', 'MSFT': 'nasdaq', 'AMZN': 'nasdaq',
     'NVDA': 'nasdaq', 'TSLA': 'nasdaq', 'META': 'nasdaq',
     'AMD': 'nasdaq', 'GOOGL': 'nasdaq',
@@ -27,7 +31,7 @@ EXCHANGE_MAP = {
 
 
 def _get_url(ticker):
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nasdaq')
     return f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/"
 
 
@@ -75,7 +79,7 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
             page = await context.new_page()
             url = _get_url(ticker)
 
-            logger.info(f"ChartExchange Playwright: loading {ticker} DP...")
+            logger.info(f"ChartExchange Playwright: loading {ticker} DP... URL={url}")
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
 
             # Wait for Dark Pool Levels table to render
@@ -129,7 +133,6 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
                 text = await page.evaluate("document.body.innerText")
                 logger.info(f"ChartExchange Playwright: fallback text parsing ({len(text)} chars)")
                 
-                # Look for price-like patterns near volume numbers
                 # Format: "459.94    405    216,874    99.75M"
                 pattern = r'(\d{2,4}\.\d{2})\s+(\d[\d,]*)\s+(\d[\d,]*)\s+'
                 matches = re.findall(pattern, text)
@@ -138,7 +141,7 @@ async def fetch_dp_playwright(ticker="QQQ", max_levels=15):
                         price = float(m[0])
                         trades = int(m[1].replace(',', ''))
                         volume = int(m[2].replace(',', ''))
-                        if volume > 100:  # Filter noise
+                        if volume > 100:
                             levels.append({
                                 'price': price,
                                 'volume': volume,
