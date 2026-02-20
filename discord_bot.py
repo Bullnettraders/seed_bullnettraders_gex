@@ -24,53 +24,75 @@ SCHEDULE_ENABLED = os.getenv('SCHEDULE_ENABLED', 'true').lower() == 'true'
 SCHEDULE_HOURS = [14, 17, 20]
 
 
+def _yahoo_price(ticker, headers, timeout=10):
+    """Fetch regularMarketPrice from Yahoo Finance. Returns None on failure."""
+    import requests as req
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
+    try:
+        r = req.get(url, headers=headers, timeout=timeout)
+        result = r.json().get('chart', {}).get('result')
+        if result and len(result) > 0:
+            price = result[0].get('meta', {}).get('regularMarketPrice')
+            if price and price > 0:
+                return float(price)
+    except Exception as e:
+        logger.debug(f"Yahoo {ticker} failed: {e}")
+    return None
+
+
 def auto_update_ratios():
     """
     Auto-calculate ratios from live market data.
-    
-    ✅ FIX: Nutzt XAUUSD=X (Spot Gold) statt GC=F (Futures)
-    GC=F auf Yahoo Finance lieferte ~5034 statt ~2930 → falscher Kontrakt.
-    XAUUSD=X ist direkter Spot-Preis → zuverlässig.
+    Gold: probiert mehrere Yahoo-Symbole als Fallback.
     """
     global RATIO, GOLD_RATIO
     import requests as req
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    # ── NAS/QQQ Ratio ──
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-
-        qqq_url = "https://query1.finance.yahoo.com/v8/finance/chart/QQQ?range=1d&interval=1d"
-        nas_url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&interval=1d"
-        gld_url = "https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1d"
-        # ✅ FIX: XAUUSD=X statt GC=F — direkter Spot-Preis, keine Futures-Probleme
-        xau_url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?range=1d&interval=1d"
-
-        qqq_r = req.get(qqq_url, headers=headers, timeout=10)
-        nas_r = req.get(nas_url, headers=headers, timeout=10)
-        gld_r = req.get(gld_url, headers=headers, timeout=10)
-        xau_r = req.get(xau_url, headers=headers, timeout=10)
-
-        qqq_price = qqq_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        nas_price = nas_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        gld_price = gld_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        xau_price = xau_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-
-        if qqq_price > 0 and nas_price > 0:
+        qqq_price = _yahoo_price('QQQ', headers)
+        nas_price = _yahoo_price('NQ%3DF', headers)  # NQ=F
+        if qqq_price and nas_price:
             new_ratio = round(nas_price / qqq_price, 2)
-            if 30 < new_ratio < 55:  # Sanity check NAS/QQQ
+            if 30 < new_ratio < 55:
                 RATIO = new_ratio
                 logger.info(f"Auto-Ratio NAS/QQQ: {RATIO} (NAS={nas_price}, QQQ={qqq_price})")
+    except Exception as e:
+        logger.warning(f"NAS ratio failed: {e}")
 
-        if gld_price > 0 and xau_price > 0:
+    # ── XAUUSD/GLD Ratio ──
+    # Yahoo Finance Symbole für Gold Spot (Fallback-Kette)
+    GOLD_SYMBOLS = ['GC%3DF', 'XAUUSD%3DX', 'GLD']  # GC=F, XAUUSD=X
+    try:
+        gld_price = _yahoo_price('GLD', headers)
+        if not gld_price:
+            logger.warning("GLD price not available")
+            return
+
+        xau_price = None
+        # GC=F: Yahoo Futures-Preis — divide by 1 (ist in USD/oz wie XAUUSD)
+        # Aber GC=F kann falschen Kontrakt geben → prüfe Plausibilität
+        for symbol in ['GC%3DF', 'XAUUSD%3DX', 'SI%3DF']:
+            price = _yahoo_price(symbol, headers)
+            if price and 2000 < price < 5000:  # Plausibel für XAUUSD (2000-5000 USD/oz)
+                xau_price = price
+                logger.info(f"Gold Spot via {symbol}: {xau_price}")
+                break
+            elif price:
+                logger.warning(f"Gold symbol {symbol}: {price} ausserhalb Plausibilitaet (2000-5000)")
+
+        if gld_price and xau_price:
             new_gold = round(xau_price / gld_price, 4)
-            # ✅ FIX: Sanity check angepasst — korrekter Bereich für XAUUSD/GLD
-            # Formel: ~2930 XAUUSD / ~460 GLD = ~6.37
             if 5.0 < new_gold < 8.0:
                 GOLD_RATIO = new_gold
                 logger.info(f"Auto-Ratio XAUUSD/GLD: {GOLD_RATIO} (XAUUSD={xau_price}, GLD={gld_price})")
             else:
-                logger.warning(f"Auto-Ratio XAUUSD/GLD: {new_gold} ausserhalb Sanity-Check (5-8), behalte {GOLD_RATIO}")
-
+                logger.warning(f"Gold Ratio {new_gold} ausserhalb 5-8, behalte {GOLD_RATIO}")
+        else:
+            logger.warning(f"Kein gueltiger Gold Spot Preis gefunden, behalte {GOLD_RATIO}")
     except Exception as e:
-        logger.warning(f"Auto-ratio failed (using defaults): {e}")
+        logger.warning(f"Gold ratio failed: {e}")
 
 
 intents = discord.Intents.default()
@@ -732,17 +754,17 @@ async def cmd_test(ctx):
         await ctx.send(f"CBOE Fehler: {e}")
 
     try:
-        # Ratio Test
-        import requests as req
         headers = {'User-Agent': 'Mozilla/5.0'}
-        xau_r = req.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?range=1d&interval=1d",
-                        headers=headers, timeout=10)
-        gld_r = req.get("https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1d",
-                        headers=headers, timeout=10)
-        xau = xau_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        gld = gld_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        ratio = round(xau / gld, 4)
-        await ctx.send(f"Ratio Test: XAUUSD={xau:.2f} / GLD={gld:.2f} = **{ratio:.4f}** (aktuell: {GOLD_RATIO:.4f})")
+        GOLD_SYMBOLS = {'GC%3DF': 'GC=F', 'XAUUSD%3DX': 'XAUUSD=X'}
+        gld = _yahoo_price('GLD', headers)
+        results = []
+        for sym, label in GOLD_SYMBOLS.items():
+            price = _yahoo_price(sym, headers)
+            plausible = "✅" if price and 2000 < price < 5000 else "❌"
+            ratio = round(price / gld, 4) if price and gld else "N/A"
+            results.append(f"{plausible} {label}: {price} → Ratio: {ratio}")
+        lines = [f"GLD Spot: "] + results + [f"Aktiver GOLD_RATIO: **{GOLD_RATIO:.4f}**"]
+        await ctx.send("")
     except Exception as e:
         await ctx.send(f"Ratio Test Fehler: {e}")
 
