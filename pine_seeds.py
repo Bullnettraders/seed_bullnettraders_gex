@@ -172,6 +172,83 @@ def push_all_levels(nasdaq_levels=None, nasdaq_spot=0, gold_levels=None, gold_sp
     return success
 
 
+def push_bt_to_github(ticker="QQQ", prints_data=None):
+    """
+    Push top 3 Block Trade prices to GitHub pine_seeds repo.
+    Creates/updates: data/{ticker}_BT.csv
+    CSV: open=BT1, high=BT2, low=BT3 (top trades by volume, sorted by price)
+    """
+    if not GITHUB_TOKEN or not GITHUB_USERNAME:
+        return False
+    if not prints_data or not prints_data.get('prints'):
+        logger.warning(f"No prints data to push for {ticker}")
+        return False
+
+    prints = prints_data.get('prints', [])
+    # Sort by shares volume desc, take top 3, then sort by price
+    top3 = sorted(prints, key=lambda x: x.get('shares', 0), reverse=True)[:3]
+    top3 = sorted(top3, key=lambda x: x.get('price', 0))
+
+    bt1 = round(top3[0]['price'], 2) if len(top3) > 0 else 0
+    bt2 = round(top3[1]['price'], 2) if len(top3) > 1 else 0
+    bt3 = round(top3[2]['price'], 2) if len(top3) > 2 else 0
+
+    if bt1 == 0:
+        logger.warning(f"No valid BT prices for {ticker}")
+        return False
+
+    now = datetime.now(timezone.utc)
+    date_str = now.strftime("%Y%m%dT")
+    new_row = f"{date_str},{bt1},{bt2},{bt3},0,1"
+
+    filepath = f"data/{ticker.upper()}_BT.csv"
+    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{REPO_NAME}/contents/{filepath}"
+    headers = {
+        'Authorization': f'token {GITHUB_TOKEN}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'BullNet-Bot',
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        existing_sha = None
+        existing_rows = []
+
+        if resp.status_code == 200:
+            file_data = resp.json()
+            existing_sha = file_data['sha']
+            content_raw = base64.b64decode(file_data['content']).decode('utf-8')
+            for line in content_raw.strip().split('\n'):
+                line = line.strip()
+                if not line or line.startswith('time'):
+                    continue
+                if line.startswith(date_str):
+                    continue
+                if line[0].isdigit() and 'T' not in line.split(',')[0]:
+                    continue
+                existing_rows.append(line)
+            existing_rows = existing_rows[-29:]
+
+        all_rows = existing_rows + [new_row]
+        csv_content = "\n".join(all_rows) + "\n"
+        content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+
+        payload = {
+            'message': f'BT update {ticker} — {now.strftime("%Y-%m-%d %H:%M")} UTC | {bt1}/{bt2}/{bt3}',
+            'content': content_b64,
+        }
+        if existing_sha:
+            payload['sha'] = existing_sha
+
+        resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        logger.info(f"Pine Seeds: pushed {ticker} BT — BT1:{bt1} BT2:{bt2} BT3:{bt3}")
+        return True
+    except Exception as e:
+        logger.error(f"Pine Seeds BT push failed: {e}")
+        return False
+
+
 def ensure_symbol_info():
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
         return False
@@ -181,6 +258,8 @@ def ensure_symbol_info():
         "GLD_gex": {"symbol": "GLD_gex", "description": "BullNet GLD GEX Levels", "pricescale": 100},
         "QQQ_dp":  {"symbol": "QQQ_dp",  "description": "BullNet QQQ Dark Pool Zones", "pricescale": 100},
         "GLD_dp":  {"symbol": "GLD_dp",  "description": "BullNet GLD Dark Pool Zones", "pricescale": 100},
+        "QQQ_BT":  {"symbol": "QQQ_BT",  "description": "BullNet QQQ Block Trades", "pricescale": 100},
+        "GLD_BT":  {"symbol": "GLD_BT",  "description": "BullNet GLD Block Trades", "pricescale": 100},
     }
 
     filepath = f"symbol_info/{REPO_NAME}.json"
