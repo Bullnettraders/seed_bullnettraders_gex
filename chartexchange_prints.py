@@ -1,7 +1,6 @@
 """
 ChartExchange Dark Pool Prints Scraper — Playwright
-Fetches top block trades with direction (Bid/Ask/Mid) from ChartExchange.
-T+1 data — yesterday's prints.
+DEBUG VERSION: logs page HTML to identify structure issues
 """
 
 import asyncio
@@ -12,15 +11,14 @@ import time
 logger = logging.getLogger(__name__)
 
 _cache = {}
-CACHE_TTL = 600  # 10 min
+CACHE_TTL = 600
 
-# ✅ FIX: GLD/SLV/SPY/IWM sind NYSE Arca (ETFs!) — war 'nyse'
 EXCHANGE_MAP = {
     'QQQ': 'nasdaq',
-    'SPY': 'nyse_arca',   # ✅ Fix
-    'IWM': 'nyse_arca',   # ✅ Fix
-    'GLD': 'nyse_arca',   # ✅ FIX: war 'nyse' → jetzt 'nyse_arca'
-    'SLV': 'nyse_arca',   # ✅ Fix
+    'SPY': 'nyse_arca',
+    'IWM': 'nyse_arca',
+    'GLD': 'nyse_arca',
+    'SLV': 'nyse_arca',
 }
 
 
@@ -30,11 +28,6 @@ def _get_url(ticker):
 
 
 async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
-    """
-    Fetch dark pool prints from ChartExchange using Playwright.
-    Returns list of {time, price, size, premium, side, exchange}
-    filtered by min_size.
-    """
     ticker = ticker.upper()
 
     cached = _cache.get(ticker)
@@ -64,7 +57,7 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
             )
 
             context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1920, 'height': 1080},
             )
 
@@ -72,46 +65,44 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
             url = _get_url(ticker)
 
             logger.info(f"DP Prints Playwright: loading {ticker}... URL={url}")
-            await page.goto(url, wait_until="networkidle", timeout=45000)
-            await asyncio.sleep(3)  # extra buffer for JS DataTable
+            await page.goto(url, wait_until='networkidle', timeout=45000)
+            await asyncio.sleep(5)
 
-            # Wait for table to render
+            # ── DEBUG: Log page title + first 3000 chars of visible text ──
+            title = await page.title()
+            logger.info(f"DP Prints DEBUG: page title = '{title}'")
+
+            body_text = await page.evaluate("document.body.innerText")
+            logger.info(f"DP Prints DEBUG: page text (first 2000 chars):\n{body_text[:2000]}")
+
+            # ── DEBUG: How many tables, what headers? ──
+            table_info = await page.evaluate("""() => {
+                const tables = document.querySelectorAll('table');
+                const info = [];
+                tables.forEach((t, i) => {
+                    const ths = Array.from(t.querySelectorAll('th')).map(h => h.textContent.trim());
+                    const rowCount = t.querySelectorAll('tbody tr').length;
+                    info.push({index: i, headers: ths, rows: rowCount});
+                });
+                return info;
+            }""")
+            logger.info(f"DP Prints DEBUG: tables found = {table_info}")
+
+            # ── Try wait for table ──
             try:
-                await page.wait_for_selector(
-                    'table tbody tr',
-                    timeout=20000
-                )
-                logger.info(f"DP Prints: table found")
+                await page.wait_for_selector('table tbody tr', timeout=20000)
+                logger.info(f"DP Prints: table found after wait")
             except Exception:
-                logger.info(f"DP Prints: waiting for JS render...")
-                await asyncio.sleep(8)
+                logger.warning(f"DP Prints: no table tbody tr found even after 20s")
 
-            # Sort by Size descending — click Size header
-            try:
-                await page.evaluate("""() => {
-                    const tables = document.querySelectorAll('table');
-                    for (const table of tables) {
-                        const headers = table.querySelectorAll('thead th');
-                        for (const th of headers) {
-                            if (th.textContent.trim().toLowerCase() === 'size') {
-                                th.click();
-                                break;
-                            }
-                        }
-                    }
-                }""")
-                await asyncio.sleep(2)
-            except Exception:
-                pass
-
-            # Extract rows from table
+            # ── Extract rows ──
             rows = await page.evaluate("""() => {
                 const results = [];
                 const tables = document.querySelectorAll('table');
                 for (const table of tables) {
                     const headers = table.querySelectorAll('thead th');
                     const headerTexts = Array.from(headers).map(h => h.textContent.trim().toLowerCase());
-                    
+
                     if (headerTexts.includes('time') && headerTexts.includes('price') && headerTexts.includes('size')) {
                         const timeIdx = headerTexts.indexOf('time');
                         const priceIdx = headerTexts.indexOf('price');
@@ -119,10 +110,10 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
                         const premiumIdx = headerTexts.indexOf('premium');
                         const sideIdx = headerTexts.indexOf('side');
                         const exchangeIdx = headerTexts.indexOf('exchange');
-                        
+
                         const tbody = table.querySelector('tbody');
                         if (!tbody) continue;
-                        
+
                         const trs = tbody.querySelectorAll('tr');
                         for (const tr of trs) {
                             const tds = tr.querySelectorAll('td');
@@ -144,9 +135,13 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
             }""")
 
             logger.info(f"DP Prints Playwright: extracted {len(rows)} rows")
+
+            # ── DEBUG: log first 3 raw rows ──
+            if rows:
+                logger.info(f"DP Prints DEBUG: first 3 rows = {rows[:3]}")
+
             await browser.close()
 
-            # Parse rows
             for row in rows:
                 try:
                     price = float(re.sub(r'[^\d.]', '', row.get('price', '0')))
@@ -156,7 +151,6 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
                     exchange = row.get('exchange', '').strip()
                     premium_str = row.get('premium', '')
 
-                    # Parse premium (e.g., "114.30M" or "68.34M")
                     premium = 0
                     pm = re.match(r'([\d.]+)\s*([MKB]?)', premium_str)
                     if pm:
@@ -177,7 +171,7 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
                             'price': price,
                             'size': size,
                             'premium': premium,
-                            'side': side,  # "Bid", "Ask", "Mid"
+                            'side': side,
                             'exchange': exchange,
                         })
                 except (ValueError, IndexError):
@@ -187,14 +181,12 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
         logger.error(f"DP Prints Playwright error: {e}")
         return []
 
-    # Sort by size descending
     prints.sort(key=lambda x: x['size'], reverse=True)
     prints = prints[:max_prints]
 
     if prints:
         _cache[ticker] = {'prints': prints, 'timestamp': time.time()}
-        logger.info(f"DP Prints SUCCESS {ticker}: {len(prints)} block trades, "
-                     f"top: {prints[0]['size']:,} @ ${prints[0]['price']:.2f} ({prints[0]['side']})")
+        logger.info(f"DP Prints SUCCESS {ticker}: {len(prints)} trades, top: {prints[0]['size']:,} @ ${prints[0]['price']:.2f}")
     else:
         logger.warning(f"DP Prints: no prints found for {ticker}")
 
@@ -202,7 +194,6 @@ async def fetch_prints_playwright(ticker="QQQ", min_size=100000, max_prints=15):
 
 
 def fetch_prints_sync(ticker="QQQ", min_size=100000, max_prints=15):
-    """Synchronous wrapper."""
     try:
         return asyncio.run(fetch_prints_playwright(ticker, min_size, max_prints))
     except RuntimeError:
@@ -213,7 +204,6 @@ def fetch_prints_sync(ticker="QQQ", min_size=100000, max_prints=15):
 
 
 def format_prints_discord(prints, ticker="QQQ", ratio=6.37):
-    """Format prints for Discord."""
     is_gold = ticker.upper() in ("GLD", "GOLD")
     etf_label = "GLD" if is_gold else ticker.upper()
     cfd_label = "XAUUSD" if is_gold else "NAS100 CFD"
@@ -222,11 +212,9 @@ def format_prints_discord(prints, ticker="QQQ", ratio=6.37):
     if not prints:
         return f"```\n{title}\n{'='*44}\n  Keine Block Trades gefunden.\n{'='*44}\n```"
 
-    # Summary: count Bid vs Ask
     bid_count = sum(1 for p in prints if 'bid' in p['side'].lower())
     ask_count = sum(1 for p in prints if 'ask' in p['side'].lower())
     mid_count = sum(1 for p in prints if 'mid' in p['side'].lower())
-
     bid_vol = sum(p['size'] for p in prints if 'bid' in p['side'].lower())
     ask_vol = sum(p['size'] for p in prints if 'ask' in p['side'].lower())
 
@@ -237,14 +225,11 @@ def format_prints_discord(prints, ticker="QQQ", ratio=6.37):
     else:
         bias = "NEUTRAL ⚪"
 
-    lines = []
-    lines.append(f"```")
-    lines.append(title)
-    lines.append("=" * 44)
-    lines.append(f"  Top Block Trades (>{100 if not is_gold else 5}K Shares)")
-    lines.append(f"  Bid: {bid_count} ({bid_vol:,}) | Ask: {ask_count} ({ask_vol:,}) | Mid: {mid_count}")
-    lines.append(f"  Block Trade Bias: {bias}")
-    lines.append("")
+    min_label = "5K" if is_gold else "100K"
+    lines = [f"```", title, "=" * 44,
+             f"  Top Block Trades (>{min_label} Shares)",
+             f"  Bid: {bid_count} ({bid_vol:,}) | Ask: {ask_count} ({ask_vol:,}) | Mid: {mid_count}",
+             f"  Block Trade Bias: {bias}", ""]
 
     for i, p in enumerate(prints[:10], 1):
         side_icon = "🟢" if 'bid' in p['side'].lower() else "🔴" if 'ask' in p['side'].lower() else "⚪"
@@ -260,28 +245,7 @@ def format_prints_discord(prints, ticker="QQQ", ratio=6.37):
         lines.append(f"     {p['time']}  [{p['exchange']}]")
         lines.append("")
 
-    lines.append("=" * 44)
-    lines.append(f"  Ratio: {ratio:.4f} | Daten: Vortag (T+1)")
-    lines.append(f"  → !dp {ticker} fuer DP Zonen im Indikator")
-    lines.append(f"```")
+    lines += ["=" * 44, f"  Ratio: {ratio:.4f} | Daten: Vortag (T+1)",
+              f"  → !dp {ticker} fuer DP Zonen im Indikator", "```"]
 
     return "\n".join(lines)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-
-    async def test():
-        for t in ["QQQ", "GLD"]:
-            print(f"\n{'='*40}")
-            print(f"  {t} Dark Pool Prints (Playwright)")
-            print(f"{'='*40}")
-            result = await fetch_prints_playwright(t, min_size=5000 if t == "GLD" else 100000)
-            if result:
-                for i, p in enumerate(result[:10], 1):
-                    side_icon = "BUY" if 'bid' in p['side'].lower() else "SELL" if 'ask' in p['side'].lower() else "MID"
-                    print(f"  {i}. ${p['price']:.3f} x {p['size']:,}  [{side_icon}]  {p['time']}")
-            else:
-                print("  FAILED")
-
-    asyncio.run(test())
