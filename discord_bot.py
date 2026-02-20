@@ -19,48 +19,59 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv('DISCORD_TOKEN', '')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 RATIO = float(os.getenv('QQQ_CFD_RATIO', '41.33'))
-GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '10.97'))
+GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '6.37'))   # ✅ Default korrigiert (war 10.97)
 SCHEDULE_ENABLED = os.getenv('SCHEDULE_ENABLED', 'true').lower() == 'true'
 SCHEDULE_HOURS = [14, 17, 20]
 
 
 def auto_update_ratios():
-    """Auto-calculate ratios from live market data."""
+    """
+    Auto-calculate ratios from live market data.
+    
+    ✅ FIX: Nutzt XAUUSD=X (Spot Gold) statt GC=F (Futures)
+    GC=F auf Yahoo Finance lieferte ~5034 statt ~2930 → falscher Kontrakt.
+    XAUUSD=X ist direkter Spot-Preis → zuverlässig.
+    """
     global RATIO, GOLD_RATIO
     import requests as req
     try:
-        # Fetch NAS100 CFD and QQQ
         headers = {'User-Agent': 'Mozilla/5.0'}
-        # Use Yahoo Finance API for quick quotes
+
         qqq_url = "https://query1.finance.yahoo.com/v8/finance/chart/QQQ?range=1d&interval=1d"
-        nas_url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ=F?range=1d&interval=1d"
+        nas_url = "https://query1.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&interval=1d"
         gld_url = "https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1d"
-        gc_url  = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1d"
+        # ✅ FIX: XAUUSD=X statt GC=F — direkter Spot-Preis, keine Futures-Probleme
+        xau_url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?range=1d&interval=1d"
 
         qqq_r = req.get(qqq_url, headers=headers, timeout=10)
         nas_r = req.get(nas_url, headers=headers, timeout=10)
         gld_r = req.get(gld_url, headers=headers, timeout=10)
-        gc_r  = req.get(gc_url, headers=headers, timeout=10)
+        xau_r = req.get(xau_url, headers=headers, timeout=10)
 
         qqq_price = qqq_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
         nas_price = nas_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
         gld_price = gld_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
-        gc_price  = gc_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        xau_price = xau_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
 
         if qqq_price > 0 and nas_price > 0:
             new_ratio = round(nas_price / qqq_price, 2)
-            if 30 < new_ratio < 55:  # Sanity check
+            if 30 < new_ratio < 55:  # Sanity check NAS/QQQ
                 RATIO = new_ratio
                 logger.info(f"Auto-Ratio NAS/QQQ: {RATIO} (NAS={nas_price}, QQQ={qqq_price})")
 
-        if gld_price > 0 and gc_price > 0:
-            new_gold = round(gc_price / gld_price, 2)
-            if 5 < new_gold < 15:  # Sanity check
+        if gld_price > 0 and xau_price > 0:
+            new_gold = round(xau_price / gld_price, 4)
+            # ✅ FIX: Sanity check angepasst — korrekter Bereich für XAUUSD/GLD
+            # Formel: ~2930 XAUUSD / ~460 GLD = ~6.37
+            if 5.0 < new_gold < 8.0:
                 GOLD_RATIO = new_gold
-                logger.info(f"Auto-Ratio XAUUSD/GLD: {GOLD_RATIO} (GC={gc_price}, GLD={gld_price})")
+                logger.info(f"Auto-Ratio XAUUSD/GLD: {GOLD_RATIO} (XAUUSD={xau_price}, GLD={gld_price})")
+            else:
+                logger.warning(f"Auto-Ratio XAUUSD/GLD: {new_gold} ausserhalb Sanity-Check (5-8), behalte {GOLD_RATIO}")
 
     except Exception as e:
         logger.warning(f"Auto-ratio failed (using defaults): {e}")
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -72,11 +83,11 @@ async def get_gex_report(ticker="QQQ", ratio=None):
     if is_gold:
         ticker = "GLD"
     r = ratio or (GOLD_RATIO if is_gold else RATIO)
-    
+
     spot = None
     levels = None
     gex_df = None
-    
+
     # ── 1. Try Barchart Playwright (exact values) ──
     try:
         from barchart_gex import fetch_barchart_gex_async
@@ -86,8 +97,7 @@ async def get_gex_report(ticker="QQQ", ratio=None):
             spot = bc_levels.get('spot', 0)
             levels = bc_levels
             logger.info(f"Barchart Playwright SUCCESS: GF={levels.get('gamma_flip')} CW={levels.get('call_wall')} PW={levels.get('put_wall')}")
-            
-            # Get HVL from CBOE if missing
+
             if 'hvl' not in levels:
                 try:
                     from gex_calculator import fetch_cboe_options, parse_options, calculate_gex, find_key_levels
@@ -110,7 +120,7 @@ async def get_gex_report(ticker="QQQ", ratio=None):
     except Exception as e:
         logger.warning(f"Barchart Playwright failed: {e}, falling back to API/CBOE")
 
-    # ── 2. Fallback: Barchart API + CBOE (sync in thread) ──
+    # ── 2. Fallback: Barchart API + CBOE ──
     if not levels or 'gamma_flip' not in levels:
         try:
             spot, levels, gex_df = await asyncio.to_thread(run_gex, ticker, r)
@@ -118,15 +128,15 @@ async def get_gex_report(ticker="QQQ", ratio=None):
             logger.error(f"GEX error: {e}")
             logger.error(traceback.format_exc())
             return None, None, str(e) + "\n" + traceback.format_exc()[-500:]
-    
+
     if not levels:
         return None, None, "Levels leer - keine Daten berechnet"
-    
-    # Fix regime if N/A but we have spot + gamma_flip
+
+    # Fix regime if N/A
     gf = levels.get('gamma_flip', 0)
     if levels.get('gamma_regime', 'N/A') == 'N/A' and spot and spot > 0 and gf > 0:
         levels['gamma_regime'] = "Positiv" if spot > gf else "Negativ"
-    
+
     text_msg = format_discord_message(spot, levels, r, ticker)
     gf = levels.get('gamma_flip', 0)
     cw = levels.get('call_wall', 0)
@@ -152,13 +162,31 @@ async def get_gex_report(ticker="QQQ", ratio=None):
         embed.add_field(name="HVL", value=f"`{hvl:.2f}` {etf_label}\n`{hvl*r:.2f}` {cfd_label}", inline=True)
     embed.set_footer(text=f"Ratio: {r:.4f} | {source.upper()} | BULLNET")
 
-    # Auto-push to GitHub pine_seeds for TradingView
+    # ✅ Auto-push zu GitHub → TradingView
     try:
         await asyncio.to_thread(push_gex_to_github, ticker, levels, spot)
+        logger.info(f"GEX TradingView push OK: {ticker}")
     except Exception as e:
         logger.warning(f"Pine seeds push failed: {e}")
 
     return text_msg, embed, None
+
+
+async def _push_dp_to_tradingview(ticker, dp, spot):
+    """Helper: DP Memory + GitHub/TradingView push nach jedem DP-Abruf."""
+    dp_ticker = "GLD" if ticker.upper() in ("GLD", "GOLD") else ticker.upper()
+    try:
+        if dp.get('levels'):
+            active_levels = await asyncio.to_thread(dp_memory_update, dp_ticker, dp['levels'], spot)
+            logger.info(f"DP Memory updated: {len(active_levels)} active levels for {dp_ticker}")
+
+            from darkpool import get_top_dp_zones
+            zones = get_top_dp_zones(dp['levels'])
+            if zones.get('dp1', 0) > 0:
+                await asyncio.to_thread(push_dp_to_github, dp_ticker, None, zones)
+                logger.info(f"DP TradingView push OK {dp_ticker}: {zones}")
+    except Exception as e:
+        logger.warning(f"DP TradingView push failed: {e}")
 
 
 @tasks.loop(minutes=30)
@@ -171,22 +199,22 @@ async def scheduled_gex():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
-    
+
     # Auto-update ratios
     try:
         await asyncio.to_thread(auto_update_ratios)
     except:
         pass
-    
+
     # Post GEX
     result = await get_gex_report()
     text_msg, embed = result[0], result[1]
     if text_msg:
         await channel.send(text_msg)
         await channel.send(embed=embed)
-    # Post Dark Pool + Block Trades at first schedule only (14:00 UTC)
+
+    # Post Dark Pool + Block Trades at 14:00 UTC only
     if now.hour == 14:
-        from darkpool import get_top_dp_zones
         from chartexchange_prints import fetch_prints_sync, format_prints_discord
 
         # ── QQQ ──
@@ -194,11 +222,9 @@ async def scheduled_gex():
             spot, _, gex_df = await asyncio.to_thread(run_gex, "QQQ", RATIO)
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
 
-            # Post DP levels
             dp_msg = format_dp_discord(dp, RATIO)
             await channel.send(dp_msg)
 
-            # Post raw block trades
             try:
                 qqq_prints = await asyncio.to_thread(fetch_prints_sync, "QQQ", 100000, 15)
                 if qqq_prints:
@@ -209,13 +235,7 @@ async def scheduled_gex():
             except Exception as e:
                 logger.warning(f"QQQ prints: {e}")
 
-            # Update DP Memory + push top 4 zones to GitHub
-            if dp.get('levels'):
-                await asyncio.to_thread(dp_memory_update, "QQQ", dp['levels'], spot)
-                zones = get_top_dp_zones(dp['levels'])
-                if zones.get('dp1', 0) > 0:
-                    await asyncio.to_thread(push_dp_to_github, "QQQ", None, zones)
-                    logger.info(f"QQQ DP push: {zones}")
+            await _push_dp_to_tradingview("QQQ", dp, spot)
         except Exception as e:
             logger.error(f"Scheduled QQQ DP error: {e}")
 
@@ -224,12 +244,10 @@ async def scheduled_gex():
             gld_spot, _, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
             gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
 
-            # Post DP levels
             if gld_dp.get('levels'):
                 gld_msg = format_dp_discord(gld_dp, GOLD_RATIO, "GLD")
                 await channel.send(gld_msg)
 
-            # Post raw block trades
             try:
                 gld_prints = await asyncio.to_thread(fetch_prints_sync, "GLD", 5000, 15)
                 if gld_prints:
@@ -240,13 +258,7 @@ async def scheduled_gex():
             except Exception as e:
                 logger.warning(f"GLD prints: {e}")
 
-            # Update DP Memory + push top 4 zones to GitHub
-            if gld_dp.get('levels'):
-                await asyncio.to_thread(dp_memory_update, "GLD", gld_dp['levels'], gld_spot)
-                gld_zones = get_top_dp_zones(gld_dp['levels'])
-                if gld_zones.get('dp1', 0) > 0:
-                    await asyncio.to_thread(push_dp_to_github, "GLD", None, gld_zones)
-                    logger.info(f"GLD DP push: {gld_zones}")
+            await _push_dp_to_tradingview("GLD", gld_dp, gld_spot)
         except Exception as e:
             logger.error(f"Scheduled GLD DP error: {e}")
 
@@ -274,7 +286,7 @@ async def cmd_gex(ctx, ticker: str = "QQQ"):
 
 @bot.command(name='gold')
 async def cmd_gold(ctx):
-    """Gold (GLD) GEX Report with XAUUSD conversion."""
+    """Gold (GLD) GEX Report mit XAUUSD Conversion."""
     async with ctx.typing():
         result = await get_gex_report("GLD")
     text_msg, embed, error = result[0], result[1], result[2]
@@ -320,17 +332,17 @@ async def cmd_goldratio(ctx, new_ratio: float = None):
     global GOLD_RATIO
     if new_ratio:
         GOLD_RATIO = new_ratio
-        await ctx.send(f"Gold Ratio gesetzt: {GOLD_RATIO:.4f}")
+        await ctx.send(f"✅ Gold Ratio gesetzt: **{GOLD_RATIO:.4f}**\nBeispiel: GLD $460 × {GOLD_RATIO:.4f} = XAUUSD ${460*GOLD_RATIO:.0f}")
     else:
-        await ctx.send(f"Gold Ratio: {GOLD_RATIO:.4f}\nBeispiel: GLD $260 x {GOLD_RATIO:.4f} = XAUUSD ${260*GOLD_RATIO:.2f}")
+        await ctx.send(f"Gold Ratio: **{GOLD_RATIO:.4f}**\nBeispiel: GLD $460 × {GOLD_RATIO:.4f} = XAUUSD ${460*GOLD_RATIO:.0f}")
 
 
 @bot.command(name='setgex')
 async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None, pw: float = None, hvl: float = None):
-    """Manually set GEX levels from Barchart and push to TradingView.
+    """Manuell GEX Levels setzen und zu TradingView pushen.
     Usage: !setgex QQQ 618.62 630 600
            !setgex GLD 391.72 475 450
-           !setgex GLD 391.72 475 450 460  (with HVL)
+           !setgex GLD 391.72 475 450 460  (mit HVL)
     """
     if not ticker or not gf or not cw or not pw:
         await ctx.send("```\n"
@@ -345,11 +357,9 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
 
     ticker = ticker.upper()
     if hvl is None:
-        hvl = cw  # Default HVL to call wall if not given
+        hvl = cw
 
-    # Determine regime
     try:
-        # Try to get current spot for regime calculation
         from gex_calculator import fetch_cboe_options
         spot, _ = await asyncio.to_thread(fetch_cboe_options, ticker)
     except:
@@ -357,7 +367,6 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
 
     regime = "Positiv" if spot and spot > gf else "Negativ"
 
-    # Build levels dict
     levels = {
         'gamma_flip': gf,
         'call_wall': cw,
@@ -368,7 +377,6 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
         'spot': spot,
     }
 
-    # Push to GitHub for TradingView auto-import
     try:
         await asyncio.to_thread(push_gex_to_github, ticker, levels, spot or 0)
         push_ok = True
@@ -376,13 +384,11 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
         logger.warning(f"setgex push failed: {e}")
         push_ok = False
 
-    # Determine labels
     is_gold = ticker in ("GLD", "GOLD")
     etf_label = "GLD" if is_gold else ticker
     r = GOLD_RATIO if is_gold else RATIO
     cfd_label = "XAUUSD" if is_gold else "NAS100"
 
-    # Build response
     lines = [
         f"GEX Levels gesetzt — {ticker}",
         "=" * 40,
@@ -392,7 +398,7 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
         f"  HVL:         {hvl:.2f} {etf_label}  =  {hvl*r:.2f} {cfd_label}",
         "",
         f"  Regime: {regime.upper()}",
-        f"  GitHub Push: {'✅' if push_ok else '❌ Fehler'}",
+        f"  TradingView Push: {'✅' if push_ok else '❌ Fehler'}",
         f"  Source: Barchart (manuell)",
         "=" * 40,
     ]
@@ -401,41 +407,32 @@ async def cmd_setgex(ctx, ticker: str = None, gf: float = None, cw: float = None
 
 @bot.command(name='darkpool')
 async def cmd_darkpool(ctx, ticker: str = "QQQ"):
-    """Dark Pool levels from previous day."""
+    """Dark Pool levels + automatischer TradingView Push."""
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     r = GOLD_RATIO if is_gold else RATIO
     etf_label = "GLD" if is_gold else "QQQ"
     cfd_label = "XAUUSD" if is_gold else "CFD"
     dp_ticker = "GLD" if is_gold else ticker
-    
+
     async with ctx.typing():
         try:
             spot, _, gex_df = await asyncio.to_thread(run_gex, ticker, r)
             dp = await asyncio.to_thread(get_dark_pool_levels, ticker, spot, gex_df)
-            
             msg = format_dp_discord(dp, r, ticker)
-            
-            # Update DP Memory
-            if dp.get('levels'):
-                active_levels = await asyncio.to_thread(dp_memory_update, dp_ticker, dp['levels'], spot)
-                logger.info(f"DP Memory: {len(active_levels)} active levels for {dp_ticker}")
-            
-            # Push top 4 DP zones to GitHub
-            if dp.get('levels'):
-                from darkpool import get_top_dp_zones
-                zones = get_top_dp_zones(dp['levels'])
-                if zones.get('dp1', 0) > 0:
-                    await asyncio.to_thread(push_dp_to_github, dp_ticker, None, zones)
-                    logger.info(f"DP GitHub push {dp_ticker}: {zones}")
+
+            # ✅ Auto TradingView Push
+            await _push_dp_to_tradingview(ticker, dp, spot)
+
         except Exception as e:
             await ctx.send(f"Dark Pool Fehler: {e}")
             return
+
     if len(msg) > 1900:
         msg = msg[:1900] + "\n```"
     await ctx.send(msg)
 
-    # Also send embed
+    # Embed
     levels = dp.get('levels', [])
     finra = dp.get('finra')
     if levels:
@@ -462,19 +459,19 @@ async def cmd_darkpool(ctx, ticker: str = "QQQ"):
                 value=f"`{finra['short_percent']}%`\n{finra['date']}",
                 inline=True
             )
-        embed.set_footer(text="Ratio: " + f"{r:.2f}" + " | BULLNET")
+        embed.set_footer(text=f"Ratio: {r:.4f} | TradingView ✅ | BULLNET")
         await ctx.send(embed=embed)
 
 
 @bot.command(name='dp')
 async def cmd_dp(ctx, ticker: str = "QQQ"):
-    """Shortcut for !darkpool."""
+    """Shortcut für !darkpool."""
     await cmd_darkpool(ctx, ticker)
 
 
 @bot.command(name='prints')
 async def cmd_prints(ctx, ticker: str = "QQQ"):
-    """Dark Pool Block Trades (>100K Shares) mit Bid/Ask Richtung."""
+    """Dark Pool Block Trades mit Bid/Ask Richtung."""
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     if is_gold:
@@ -499,20 +496,19 @@ async def cmd_prints(ctx, ticker: str = "QQQ"):
 
 @bot.command(name='dpmem')
 async def cmd_dpmem(ctx, ticker: str = "QQQ"):
-    """Show active (unvisited) Dark Pool levels from memory."""
+    """Zeige aktive (unbesuchte) Dark Pool Levels aus Memory."""
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     dp_ticker = "GLD" if is_gold else ticker
     r = GOLD_RATIO if is_gold else RATIO
-    
+
     async with ctx.typing():
         try:
             spot, _, _ = await asyncio.to_thread(run_gex, ticker, r)
         except:
             spot = None
-        
         msg = format_memory_discord(dp_ticker, spot)
-    
+
     await ctx.send(msg)
 
 
@@ -522,28 +518,26 @@ async def cmd_dpadd(ctx, price: float = 0, volume: int = 200000, ticker: str = "
     if price <= 0:
         await ctx.send("Syntax: `!dpadd 613.00 850000` oder `!dpadd 613.00 850000 GLD`")
         return
-    
+
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     dp_ticker = "GLD" if is_gold else ticker
-    
-    # Get current spot for context
     r = GOLD_RATIO if is_gold else RATIO
+
     try:
         spot, _, _ = await asyncio.to_thread(run_gex, ticker, r)
     except:
         spot = None
-    
-    # Add to memory
+
     manual_level = [{'strike': price, 'volume': volume, 'trades': 0, 'type': 'Manual DP'}]
     active = await asyncio.to_thread(dp_memory_update, dp_ticker, manual_level, spot)
-    
+
     dist_str = ""
     if spot and spot > 0:
         dist_pct = (price - spot) / spot * 100
         arrow = "↑" if dist_pct > 0 else "↓"
         dist_str = f" ({arrow}{abs(dist_pct):.2f}% von Spot)"
-    
+
     await ctx.send(f"✅ **{dp_ticker} DP Level hinzugefügt:** {price:.2f} | Vol: {volume:,}{dist_str}\n"
                    f"Aktive Levels: {len(active)} | Bleibt bis Preis es erreicht (max 14 Tage)")
 
@@ -554,23 +548,23 @@ async def cmd_dpremove(ctx, price: float = 0, ticker: str = "QQQ"):
     if price <= 0:
         await ctx.send("Syntax: `!dpremove 601.07` oder `!dpremove 450.00 GLD`")
         return
-    
+
     ticker = ticker.upper()
     is_gold = ticker in ("GLD", "GOLD")
     dp_ticker = "GLD" if is_gold else ticker
-    
+
     from dp_memory import load_memory, save_memory
     memory = load_memory()
     levels = memory.get(dp_ticker, [])
-    
+
     before = len(levels)
     levels = [l for l in levels if abs(l['price'] - price) > 0.05]
     after = len(levels)
-    
+
     if before == after:
         await ctx.send(f"❌ Level {price:.2f} nicht in Memory gefunden für {dp_ticker}.")
         return
-    
+
     memory[dp_ticker] = levels
     save_memory(memory)
     await ctx.send(f"✅ **{dp_ticker} DP Level entfernt:** {price:.2f} | Verbleibend: {after} Levels")
@@ -598,13 +592,18 @@ async def cmd_ratio(ctx, action: str = None):
     if action == "auto":
         await ctx.send("Berechne Ratios aus Live-Daten...")
         await asyncio.to_thread(auto_update_ratios)
-        await ctx.send(f"✅ **Auto-Ratio:**\nNAS/QQQ: **{RATIO:.2f}**\nXAUUSD/GLD: **{GOLD_RATIO:.2f}**")
-    elif action and action.replace('.','').isdigit():
+        await ctx.send(f"✅ **Auto-Ratio:**\nNAS/QQQ: **{RATIO:.2f}**\nXAUUSD/GLD: **{GOLD_RATIO:.4f}**\n"
+                       f"Beispiel: GLD $460 × {GOLD_RATIO:.4f} = {460*GOLD_RATIO:.0f} XAUUSD")
+    elif action and action.replace('.', '').isdigit():
         RATIO = float(action)
         await ctx.send(f"NAS Ratio gesetzt: {RATIO:.2f}")
     else:
-        await ctx.send(f"**Aktuelle Ratios:**\nNAS/QQQ: **{RATIO:.2f}**\nXAUUSD/GLD: **{GOLD_RATIO:.2f}**\n\n"
-                       f"`!ratio auto` = Live berechnen\n`!ratio 41.33` = Manuell setzen")
+        await ctx.send(f"**Aktuelle Ratios:**\n"
+                       f"NAS/QQQ: **{RATIO:.2f}**\n"
+                       f"XAUUSD/GLD: **{GOLD_RATIO:.4f}**\n"
+                       f"Beispiel: GLD $460 × {GOLD_RATIO:.4f} = {460*GOLD_RATIO:.0f} XAUUSD\n\n"
+                       f"`!ratio auto` = Live berechnen\n"
+                       f"`!goldratio 6.37` = Gold Ratio manuell setzen")
 
 
 @bot.command(name='levels')
@@ -633,21 +632,19 @@ async def cmd_levels(ctx):
 
 @bot.command(name='all')
 async def cmd_all(ctx):
-    """Full report: GEX + Dark Pool + Gold combined."""
+    """Full report: GEX + Dark Pool + Gold kombiniert."""
     async with ctx.typing():
-        # Nasdaq GEX
         result = await get_gex_report("QQQ")
         text_msg, embed, error = result[0], result[1], result[2]
 
-        # Dark Pool
         try:
             spot, _, gex_df = await asyncio.to_thread(run_gex, "QQQ", RATIO)
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
             dp_msg = format_dp_discord(dp, RATIO)
+            await _push_dp_to_tradingview("QQQ", dp, spot)
         except:
             dp_msg = None
 
-        # Gold GEX
         gold_result = await get_gex_report("GLD")
         gold_msg, gold_embed, gold_error = gold_result[0], gold_result[1], gold_result[2]
 
@@ -666,18 +663,32 @@ async def cmd_all(ctx):
 @bot.command(name='test')
 async def cmd_test(ctx):
     import requests
-    await ctx.send("Teste CBOE Verbindung...")
+    await ctx.send("Teste Verbindungen...")
     try:
+        # CBOE Test
         url = "https://cdn.cboe.com/api/global/delayed_quotes/options/QQQ.json"
         headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
         resp = requests.get(url, headers=headers, timeout=30)
-        await ctx.send(f"Status: {resp.status_code} | Size: {len(resp.text)} bytes")
-        data = resp.json()
-        spot = data.get('data', {}).get('close', 'N/A')
-        opts = len(data.get('data', {}).get('options', []))
-        await ctx.send(f"Spot: {spot} | Options: {opts}")
+        spot = resp.json().get('data', {}).get('close', 'N/A')
+        opts = len(resp.json().get('data', {}).get('options', []))
+        await ctx.send(f"CBOE: {resp.status_code} | Spot: {spot} | Options: {opts}")
     except Exception as e:
         await ctx.send(f"CBOE Fehler: {e}")
+
+    try:
+        # Ratio Test
+        import requests as req
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        xau_r = req.get("https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD%3DX?range=1d&interval=1d",
+                        headers=headers, timeout=10)
+        gld_r = req.get("https://query1.finance.yahoo.com/v8/finance/chart/GLD?range=1d&interval=1d",
+                        headers=headers, timeout=10)
+        xau = xau_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        gld = gld_r.json()['chart']['result'][0]['meta']['regularMarketPrice']
+        ratio = round(xau / gld, 4)
+        await ctx.send(f"Ratio Test: XAUUSD={xau:.2f} / GLD={gld:.2f} = **{ratio:.4f}** (aktuell: {GOLD_RATIO:.4f})")
+    except Exception as e:
+        await ctx.send(f"Ratio Test Fehler: {e}")
 
 
 @bot.command(name='hilfe')
@@ -698,14 +709,23 @@ async def cmd_help_de(ctx):
     msg += "!gold        Gold GEX Report\n"
     msg += "!goldlevels  XAUUSD Werte\n"
     msg += "!goldratio   Gold Ratio setzen\n"
+    msg += "!dp Gold     Gold Dark Pool\n"
+    msg += "!prints GLD  Gold Block Trades\n"
+    msg += "-----------------------------------\n"
+    msg += "  DARK POOL MEMORY\n"
+    msg += "-----------------------------------\n"
+    msg += "!dpmem       Aktive DP Levels\n"
+    msg += "!dpadd       Level hinzufügen\n"
+    msg += "!dpremove    Level entfernen\n"
     msg += "-----------------------------------\n"
     msg += "  KOMBI\n"
     msg += "-----------------------------------\n"
     msg += "!all         NAS + DP + Gold\n"
-    msg += "!test        CBOE Verbindung\n"
+    msg += "!test        Verbindungstest\n"
     msg += "!hilfe       Diese Hilfe\n"
     msg += "===================================\n"
-    msg += "Auto: 14:00, 17:00, 20:30 UTC"
+    msg += "Auto: 14:00, 17:00, 20:00 UTC\n"
+    msg += "TradingView: auto-push bei jedem DP"
     await ctx.send("```\n" + msg + "\n```")
 
 
