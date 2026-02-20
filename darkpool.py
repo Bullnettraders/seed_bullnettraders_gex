@@ -18,11 +18,9 @@ logger = logging.getLogger(__name__)
 #  CHARTEXCHANGE SYMBOL IDs (internal)
 # ═══════════════════════════════════════════════════════════
 
-# To find new IDs: Open DevTools → Network → XHR → look at datatable POST payload → symbol_
 SYMBOL_IDS = {
     'QQQ': '2017015',
     'SPY': '2005153',
-    # GLD: auto-discovered (exchange varies: nyse/amex/nysearca)
     'IWM': '2005154',
     'AAPL': '2000335',
     'MSFT': '2000653',
@@ -34,18 +32,21 @@ SYMBOL_IDS = {
     'GOOGL': '2000458',
 }
 
-# Exchange prefixes for ChartExchange URLs
+# ✅ FIX: GLD/SLV/SPY/IWM sind NYSE Arca (ETFs!) — war 'nyse'
 EXCHANGE_MAP = {
     'QQQ': 'nasdaq', 'AAPL': 'nasdaq', 'MSFT': 'nasdaq', 'AMZN': 'nasdaq',
     'GOOGL': 'nasdaq', 'META': 'nasdaq', 'NVDA': 'nasdaq', 'TSLA': 'nasdaq',
     'AMD': 'nasdaq', 'NFLX': 'nasdaq', 'INTC': 'nasdaq',
-    'GLD': 'nyse', 'SPY': 'nyse', 'IWM': 'nyse',
+    'GLD': 'nyse_arca',   # ✅ FIX: war 'nyse'
+    'SLV': 'nyse_arca',   # ✅ FIX: war 'nyse'
+    'SPY': 'nyse_arca',   # ✅ FIX: war 'nyse'
+    'IWM': 'nyse_arca',   # ✅ FIX: war 'nyse'
 }
 
-# Alternative exchanges to try if primary fails
+# ✅ FIX: nyse_arca zuerst + korrekte Schreibweise (war 'nysearca')
 EXCHANGE_ALTERNATIVES = {
-    'GLD': ['amex', 'nysearca', 'nyse'],
-    'SLV': ['amex', 'nysearca', 'nyse'],
+    'GLD': ['nyse_arca', 'amex', 'nyse'],
+    'SLV': ['nyse_arca', 'amex', 'nyse'],
 }
 
 
@@ -56,14 +57,14 @@ def _discover_symbol_id(ticker):
     Tries multiple exchange prefixes if needed.
     """
     exchanges_to_try = EXCHANGE_ALTERNATIVES.get(ticker.upper(), [])
-    primary = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    primary = EXCHANGE_MAP.get(ticker.upper(), 'nyse_arca')
     if primary not in exchanges_to_try:
         exchanges_to_try = [primary] + exchanges_to_try
-    
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     }
-    
+
     for exchange in exchanges_to_try:
         url = f"https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/"
         try:
@@ -71,16 +72,15 @@ def _discover_symbol_id(ticker):
             if resp.status_code != 200:
                 logger.info(f"Discovery: {exchange}-{ticker.lower()} returned {resp.status_code}, trying next...")
                 continue
-            
-            # Look for symbol ID patterns in the page source
+
             patterns = [
                 r'symbol[_\-]?[iI]d["\s:=]+["\']?(\d{5,10})',
                 r'"symbol_":\s*"(\d{5,10})"',
                 r"symbol_.*?['\"](\d{5,10})['\"]",
                 r'data-symbol[_-]?id[=:]["\'](\d{5,10})',
-                r'/(\d{7})\b',  # 7-digit IDs in URLs
+                r'/(\d{7})\b',
             ]
-            
+
             for pattern in patterns:
                 m = re.search(pattern, resp.text)
                 if m:
@@ -89,11 +89,11 @@ def _discover_symbol_id(ticker):
                     SYMBOL_IDS[ticker.upper()] = sid
                     EXCHANGE_MAP[ticker.upper()] = exchange
                     return sid
-            
+
             logger.info(f"Discovery: no ID found in {exchange}-{ticker.lower()} page")
         except Exception as e:
             logger.warning(f"Discovery {exchange}-{ticker.lower()} failed: {e}")
-    
+
     logger.warning(f"Discovery: could not find symbol ID for {ticker} in any exchange")
     return None
 
@@ -110,19 +110,17 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
     """
     symbol_id = SYMBOL_IDS.get(ticker.upper())
     if not symbol_id:
-        # Try auto-discovery
         symbol_id = _discover_symbol_id(ticker)
         if not symbol_id:
             logger.warning(f"No ChartExchange symbol ID for {ticker}. Known: {list(SYMBOL_IDS.keys())}")
             return []
 
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse_arca')
 
-    # Yesterday's date (DP data is T+1)
     today = datetime.now()
     for days_back in range(1, 5):
         date = today - timedelta(days=days_back)
-        if date.weekday() < 5:  # Skip weekends
+        if date.weekday() < 5:
             date_str = date.strftime('%Y-%m-%d')
             break
     else:
@@ -138,7 +136,7 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
             {"data": "notional", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
             {"data": "volume", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
         ],
-        "order": [{"column": 3, "dir": "desc"}],  # Sort by volume descending
+        "order": [{"column": 3, "dir": "desc"}],
         "start": 0,
         "length": max_results,
         "search": {"value": "", "regex": False},
@@ -165,7 +163,6 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
 
         if resp.status_code != 200:
             logger.warning(f"ChartExchange API returned {resp.status_code}")
-            # Try with most_recent_ = True as fallback
             payload["most_recent_"] = True
             payload.pop("date_", None)
             resp = requests.post(url, json=payload, headers=headers, timeout=15)
@@ -177,7 +174,6 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
         records = data.get('data', [])
         logger.info(f"ChartExchange API: got {len(records)} records")
 
-        # If 0 records with hardcoded ID, try rediscovering
         if len(records) == 0 and ticker.upper() in SYMBOL_IDS:
             logger.info(f"ChartExchange: 0 records with ID {symbol_id}, trying rediscovery...")
             old_id = SYMBOL_IDS.pop(ticker.upper(), None)
@@ -185,7 +181,7 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
             if new_id and new_id != old_id:
                 logger.info(f"ChartExchange: rediscovered {ticker} ID: {old_id} → {new_id}")
                 payload["symbol_"] = new_id
-                exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+                exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse_arca')
                 headers['Referer'] = f'https://chartexchange.com/symbol/{exchange}-{ticker.lower()}/exchange-volume/'
                 resp2 = requests.post(url, json=payload, headers=headers, timeout=15)
                 if resp2.status_code == 200:
@@ -193,13 +189,11 @@ def fetch_chartexchange_api(ticker="QQQ", max_results=15):
                     records = data.get('data', [])
                     logger.info(f"ChartExchange API retry: got {len(records)} records with new ID {new_id}")
             else:
-                # Put old ID back
                 if old_id:
                     SYMBOL_IDS[ticker.upper()] = old_id
 
         for rec in records:
             try:
-                # DataTables returns rendered HTML — extract numbers
                 price = _extract_number(rec.get('level', ''))
                 volume = _extract_number(rec.get('volume', ''))
                 trades = _extract_number(rec.get('trades', ''))
@@ -227,7 +221,6 @@ def _extract_number(val):
     """Extract a number from a DataTable cell (might be HTML or plain text)."""
     if val is None:
         return None
-    # Convert to string and strip HTML tags
     s = str(val)
     s = re.sub(r'<[^>]+>', '', s)
     s = s.replace(',', '').replace('$', '').strip()
@@ -236,7 +229,6 @@ def _extract_number(val):
     try:
         return float(s)
     except ValueError:
-        # Try extracting first number
         m = re.search(r'[\d.]+', s)
         if m:
             return float(m.group())
@@ -257,7 +249,7 @@ def fetch_chartexchange_prints(ticker="QQQ", max_results=50):
         symbol_id = _discover_symbol_id(ticker)
         if not symbol_id:
             return []
-    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse')
+    exchange = EXCHANGE_MAP.get(ticker.upper(), 'nyse_arca')
 
     today = datetime.now()
     for days_back in range(1, 5):
@@ -278,7 +270,7 @@ def fetch_chartexchange_prints(ticker="QQQ", max_results=50):
             {"data": "size", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
             {"data": "notional", "name": "", "searchable": True, "orderable": True, "search": {"value": "", "regex": False}},
         ],
-        "order": [{"column": 3, "dir": "desc"}],  # Sort by notional value
+        "order": [{"column": 3, "dir": "desc"}],
         "start": 0,
         "length": max_results,
         "search": {"value": "", "regex": False},
@@ -420,60 +412,47 @@ def derive_dp_levels_from_options(spot, gex_df):
 def _cluster_dp_levels(levels, threshold_pct=0.15):
     """
     Cluster nearby dark pool levels into zones.
-    
     Levels within threshold_pct% of each other are merged.
     Result: volume-weighted average price, summed volume/trades.
-    
-    Example: 459.27, 459.35, 459.36, 459.40, 459.50, 459.94
-    With 0.15% threshold (~$0.69 at $460):
-      Cluster 1: 459.27-459.50 → one zone
-      Cluster 2: 459.94 → separate zone
     """
     if not levels:
         return []
-    
-    # Sort by price ascending
+
     sorted_levels = sorted(levels, key=lambda x: x['price'])
-    
+
     clusters = []
     current_cluster = [sorted_levels[0]]
-    
+
     for i in range(1, len(sorted_levels)):
         lvl = sorted_levels[i]
-        # Compare to the volume-weighted center of current cluster
         cluster_center = sum(l['price'] * l['volume'] for l in current_cluster) / max(sum(l['volume'] for l in current_cluster), 1)
-        
-        # If within threshold, add to cluster
+
         if abs(lvl['price'] - cluster_center) / cluster_center < (threshold_pct / 100):
             current_cluster.append(lvl)
         else:
             clusters.append(current_cluster)
             current_cluster = [lvl]
-    
-    clusters.append(current_cluster)  # Don't forget last cluster
-    
-    # Merge each cluster into a single zone
+
+    clusters.append(current_cluster)
+
     merged = []
     for cluster in clusters:
         total_vol = sum(l['volume'] for l in cluster)
         total_trades = sum(l.get('trades', 0) for l in cluster)
-        
-        # Volume-weighted average price
+
         if total_vol > 0:
             vwap = sum(l['price'] * l['volume'] for l in cluster) / total_vol
         else:
             vwap = sum(l['price'] for l in cluster) / len(cluster)
-        
+
         merged.append({
             'price': round(vwap, 2),
             'volume': total_vol,
             'trades': total_trades,
-            'num_levels': len(cluster),  # How many raw levels merged
+            'num_levels': len(cluster),
         })
-    
-    logger.info(f"Clustering: {len(levels)} raw → {len(merged)} zones "
-                f"(threshold: {threshold_pct}%)")
-    
+
+    logger.info(f"Clustering: {len(levels)} raw → {len(merged)} zones (threshold: {threshold_pct}%)")
     return merged
 
 
@@ -483,23 +462,15 @@ def _cluster_dp_levels(levels, threshold_pct=0.15):
 
 def enrich_levels_with_direction(levels, prints, threshold_pct=0.15):
     """
-    For each DP level, check nearby prints to determine if it's Buy or Sell.
-    
-    Args:
-        levels: list of {'strike': float, 'volume': int, 'type': str, ...}
-        prints: list of {'price': float, 'size': int, 'side': str, ...}
-        threshold_pct: how close a print must be to a level (% of price)
-    
-    Returns: levels with added 'side' field ('Buy', 'Sell', or 'Neutral')
+    For each DP level, check nearby prints to determine Buy/Sell direction.
     """
     if not prints:
         return levels
-    
+
     for lvl in levels:
         strike = lvl['strike']
         threshold = strike * (threshold_pct / 100)
-        
-        # Find prints near this level
+
         bid_vol = 0
         ask_vol = 0
         for p in prints:
@@ -508,18 +479,18 @@ def enrich_levels_with_direction(levels, prints, threshold_pct=0.15):
                     bid_vol += p.get('size', 0)
                 elif 'ask' in p.get('side', '').lower():
                     ask_vol += p.get('size', 0)
-        
+
         if bid_vol > ask_vol * 1.2:
             lvl['side'] = 'Buy'
         elif ask_vol > bid_vol * 1.2:
             lvl['side'] = 'Sell'
         else:
             lvl['side'] = 'Neutral'
-        
+
         lvl['bid_vol'] = bid_vol
         lvl['ask_vol'] = ask_vol
         logger.debug(f"Level {strike:.2f}: Bid={bid_vol:,} Ask={ask_vol:,} → {lvl['side']}")
-    
+
     return levels
 
 
@@ -529,18 +500,16 @@ def get_top_dp_zones(levels, n=4):
     Returns dict with dp1, dp2, dp3, dp4 (ETF prices), sorted by price.
     """
     result = {'dp1': 0.0, 'dp2': 0.0, 'dp3': 0.0, 'dp4': 0.0}
-    
+
     if not levels:
         return result
-    
-    # Sort by volume descending, take top N
+
     top = sorted(levels, key=lambda x: x.get('volume', 0), reverse=True)[:n]
-    # Then sort by price for consistent chart display
     top = sorted(top, key=lambda x: x['strike'])
-    
+
     for i, lvl in enumerate(top):
         result[f'dp{i+1}'] = lvl['strike']
-    
+
     return result
 
 
@@ -551,8 +520,9 @@ def get_top_dp_zones(levels, n=4):
 def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
     """
     Get dark pool levels. Priority:
-    1. ChartExchange API (direct POST — no Selenium!)
-    2. Options-derived — Fallback aus OI/Volume
+    1. ChartExchange Playwright (browser-based)
+    2. ChartExchange direct API
+    3. Options-derived fallback
     Always includes FINRA short volume.
     """
     result = {
@@ -593,9 +563,7 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
             levels_data = [l for l in levels_data if abs(l['price'] - spot) / spot < 0.20]
             logger.info(f"After spot filter (±20% of {spot}): {len(levels_data)} levels remain")
 
-        # ── Cluster nearby levels into zones ──
-        # Levels within 0.15% of each other are merged into one zone
-        # Representative price = volume-weighted average, volumes summed
+        # Cluster nearby levels into zones
         clustered = _cluster_dp_levels(levels_data, threshold_pct=0.15)
         logger.info(f"Clustered {len(levels_data)} levels → {len(clustered)} zones")
 
@@ -627,7 +595,7 @@ def get_dark_pool_levels(ticker="QQQ", spot=None, gex_df=None):
 
     # 2. Fallback: Options-derived
     if not result['levels']:
-        logger.info("ChartExchange API returned no data, trying options-derived fallback...")
+        logger.info("ChartExchange returned no data, trying options-derived fallback...")
 
         if (gex_df is None or (hasattr(gex_df, 'empty') and gex_df.empty)) and spot:
             try:
@@ -728,7 +696,7 @@ def format_dp_discord(dp_data, ratio=41.33, ticker="QQQ"):
         lines.append("--- INDIKATOR INPUT (Top 4) ---")
         lines.append("")
         for i, lvl in enumerate(top4, 1):
-            lines.append(f"  DP Zone {i}: {lvl['strike']:.2f}  ({lvl.get('volume',0):,} Vol)")
+            lines.append(f"  DP Zone {i}: {lvl['strike']:.2f}  ({lvl.get('volume', 0):,} Vol)")
         lines.append("")
 
     else:
