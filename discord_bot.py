@@ -21,7 +21,9 @@ CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 RATIO = float(os.getenv('QQQ_CFD_RATIO', '41.33'))
 GOLD_RATIO = float(os.getenv('GLD_XAUUSD_RATIO', '10.97'))   # ✅ Default korrigiert (war 10.97)
 SCHEDULE_ENABLED = os.getenv('SCHEDULE_ENABLED', 'true').lower() == 'true'
-SCHEDULE_HOURS = [14, 17, 20]
+# Discord Post Zeiten in Berliner Zeit (automatische Sommer/Winter Umstellung)
+# 09:00, 13:00, 14:30, 20:00 Uhr DE
+SCHEDULE_TIMES_DE = [(9, 0), (13, 0), (14, 30), (20, 0)]  # (Stunde, Minute) Berliner Zeit
 
 
 def _yahoo_price(ticker, headers=None, timeout=10):
@@ -292,16 +294,29 @@ async def scheduled_gex():
     - GEX Report in Discord posten
     - DP + Block Trades um 14:00 UTC posten
     """
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:
+    import pytz
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:  # Kein Post am Wochenende
         return
-    if now.hour not in SCHEDULE_HOURS or now.minute > 5:
+
+    # Berliner Zeit berechnen (automatische Sommer/Winterzeit)
+    de_tz = pytz.timezone('Europe/Berlin')
+    now_de = now_utc.astimezone(de_tz)
+    h_de, m_de = now_de.hour, now_de.minute
+
+    # Prüfe ob jetzt eine Post-Zeit ist (±5 Min Toleranz)
+    is_post_time = any(
+        h_de == h and abs(m_de - m) <= 5
+        for h, m in SCHEDULE_TIMES_DE
+    )
+    if not is_post_time:
         return
+
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
-    logger.info(f"Scheduled Discord Post: {now.hour}:00 UTC")
+    logger.info(f"Scheduled Discord Post: {h_de:02d}:{m_de:02d} Berliner Zeit")
 
     # ── GEX Posts: QQQ + GLD ──
     result = await get_gex_report("QQQ")
@@ -316,8 +331,8 @@ async def scheduled_gex():
         await channel.send(gold_msg)
         await channel.send(embed=gold_embed)
 
-    # ── DP + Block Trades: nur um 14:00 UTC (nach Marktopen) ──
-    if now.hour == 14:
+    # ── DP + Block Trades: um 09:00 und 14:30 DE ──
+    if (h_de == 9 and m_de <= 5) or (h_de == 14 and 28 <= m_de <= 35):
         from chartexchange_prints import fetch_prints_sync, format_prints_discord
 
         # QQQ DP + Prints
@@ -840,7 +855,7 @@ async def on_ready():
     # Loop 2: Zu festen Zeiten in Discord posten
     if SCHEDULE_ENABLED and CHANNEL_ID > 0:
         scheduled_gex.start()
-        logger.info(f"Discord Scheduler gestartet: {SCHEDULE_HOURS} UTC")
+        logger.info(f"Discord Scheduler gestartet: 09:00, 13:00, 14:30, 20:00 Berliner Zeit")
 
 
 if __name__ == "__main__":
