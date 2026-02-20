@@ -238,6 +238,7 @@ async def _push_bt_to_tradingview(ticker, prints_data):
         logger.warning(f"BT TradingView push failed: {e}")
 
 
+@tasks.loop(minutes=30)
 async def auto_push_tradingview():
     """
     Alle 30 Minuten automatisch:
