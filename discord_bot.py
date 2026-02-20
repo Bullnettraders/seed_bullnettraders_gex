@@ -189,8 +189,80 @@ async def _push_dp_to_tradingview(ticker, dp, spot):
         logger.warning(f"DP TradingView push failed: {e}")
 
 
+# ═══════════════════════════════════════════════════════════
+#  LOOP 1 — Alle 30 Min: Daten holen + TradingView pushen (still)
+#  Läuft immer während Marktzeiten, kein Discord Post
+# ═══════════════════════════════════════════════════════════
+
+@tasks.loop(minutes=30)
+async def auto_push_tradingview():
+    """
+    Alle 30 Minuten automatisch:
+    - Ratios aktualisieren
+    - GEX + DP Daten holen (QQQ + GLD)
+    - Zu TradingView / GitHub pushen
+    Kein Discord Post — nur stiller Background-Sync.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Nur Wochentage, nur während Marktzeiten (13:00-22:00 UTC = 9am-6pm ET)
+    if now.weekday() >= 5:
+        return
+    if not (13 <= now.hour <= 22):
+        return
+
+    logger.info(f"Auto TradingView Sync: {now.strftime('%H:%M')} UTC")
+
+    # 1. Ratios aktualisieren
+    try:
+        await asyncio.to_thread(auto_update_ratios)
+    except Exception as e:
+        logger.warning(f"Auto-ratio failed: {e}")
+
+    # 2. QQQ — GEX + DP push
+    try:
+        spot, levels, gex_df = await asyncio.to_thread(run_gex, "QQQ", RATIO)
+        if levels and 'gamma_flip' in levels:
+            await asyncio.to_thread(push_gex_to_github, "QQQ", levels, spot)
+            logger.info(f"TradingView GEX push OK: QQQ GF={levels.get('gamma_flip')}")
+
+        dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
+        await _push_dp_to_tradingview("QQQ", dp, spot)
+    except Exception as e:
+        logger.warning(f"Auto-push QQQ failed: {e}")
+
+    # 3. GLD — GEX + DP push
+    try:
+        gld_spot, gld_levels, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
+        if gld_levels and 'gamma_flip' in gld_levels:
+            await asyncio.to_thread(push_gex_to_github, "GLD", gld_levels, gld_spot)
+            logger.info(f"TradingView GEX push OK: GLD GF={gld_levels.get('gamma_flip')}")
+
+        gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
+        await _push_dp_to_tradingview("GLD", gld_dp, gld_spot)
+    except Exception as e:
+        logger.warning(f"Auto-push GLD failed: {e}")
+
+    logger.info(f"Auto TradingView Sync abgeschlossen.")
+
+
+@auto_push_tradingview.before_loop
+async def before_auto_push():
+    await bot.wait_until_ready()
+
+
+# ═══════════════════════════════════════════════════════════
+#  LOOP 2 — Zu festen Uhrzeiten: Discord Posts
+#  Postet GEX + DP Reports in den Channel
+# ═══════════════════════════════════════════════════════════
+
 @tasks.loop(minutes=30)
 async def scheduled_gex():
+    """
+    Zu festen Uhrzeiten (14:00, 17:00, 20:00 UTC):
+    - GEX Report in Discord posten
+    - DP + Block Trades um 14:00 UTC posten
+    """
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
         return
@@ -200,65 +272,49 @@ async def scheduled_gex():
     if not channel:
         return
 
-    # Auto-update ratios
-    try:
-        await asyncio.to_thread(auto_update_ratios)
-    except:
-        pass
+    logger.info(f"Scheduled Discord Post: {now.hour}:00 UTC")
 
-    # Post GEX
-    result = await get_gex_report()
+    # ── GEX Posts: QQQ + GLD ──
+    result = await get_gex_report("QQQ")
     text_msg, embed = result[0], result[1]
     if text_msg:
         await channel.send(text_msg)
         await channel.send(embed=embed)
 
-    # Post Dark Pool + Block Trades at 14:00 UTC only
+    gold_result = await get_gex_report("GLD")
+    gold_msg, gold_embed = gold_result[0], gold_result[1]
+    if gold_msg:
+        await channel.send(gold_msg)
+        await channel.send(embed=gold_embed)
+
+    # ── DP + Block Trades: nur um 14:00 UTC (nach Marktopen) ──
     if now.hour == 14:
         from chartexchange_prints import fetch_prints_sync, format_prints_discord
 
-        # ── QQQ ──
+        # QQQ DP + Prints
         try:
             spot, _, gex_df = await asyncio.to_thread(run_gex, "QQQ", RATIO)
             dp = await asyncio.to_thread(get_dark_pool_levels, "QQQ", spot, gex_df)
+            await channel.send(format_dp_discord(dp, RATIO))
 
-            dp_msg = format_dp_discord(dp, RATIO)
-            await channel.send(dp_msg)
-
-            try:
-                qqq_prints = await asyncio.to_thread(fetch_prints_sync, "QQQ", 100000, 15)
-                if qqq_prints:
-                    prints_msg = format_prints_discord(qqq_prints, "QQQ", RATIO)
-                    if len(prints_msg) > 1950:
-                        prints_msg = prints_msg[:1950] + "\n```"
-                    await channel.send(prints_msg)
-            except Exception as e:
-                logger.warning(f"QQQ prints: {e}")
-
-            await _push_dp_to_tradingview("QQQ", dp, spot)
+            qqq_prints = await asyncio.to_thread(fetch_prints_sync, "QQQ", 100000, 15)
+            if qqq_prints:
+                msg = format_prints_discord(qqq_prints, "QQQ", RATIO)
+                await channel.send(msg[:1950] + "\n```" if len(msg) > 1950 else msg)
         except Exception as e:
             logger.error(f"Scheduled QQQ DP error: {e}")
 
-        # ── GLD ──
+        # GLD DP + Prints
         try:
             gld_spot, _, gld_gex = await asyncio.to_thread(run_gex, "GLD", GOLD_RATIO)
             gld_dp = await asyncio.to_thread(get_dark_pool_levels, "GLD", gld_spot, gld_gex)
-
             if gld_dp.get('levels'):
-                gld_msg = format_dp_discord(gld_dp, GOLD_RATIO, "GLD")
-                await channel.send(gld_msg)
+                await channel.send(format_dp_discord(gld_dp, GOLD_RATIO, "GLD"))
 
-            try:
-                gld_prints = await asyncio.to_thread(fetch_prints_sync, "GLD", 5000, 15)
-                if gld_prints:
-                    gld_prints_msg = format_prints_discord(gld_prints, "GLD", GOLD_RATIO)
-                    if len(gld_prints_msg) > 1950:
-                        gld_prints_msg = gld_prints_msg[:1950] + "\n```"
-                    await channel.send(gld_prints_msg)
-            except Exception as e:
-                logger.warning(f"GLD prints: {e}")
-
-            await _push_dp_to_tradingview("GLD", gld_dp, gld_spot)
+            gld_prints = await asyncio.to_thread(fetch_prints_sync, "GLD", 5000, 15)
+            if gld_prints:
+                msg = format_prints_discord(gld_prints, "GLD", GOLD_RATIO)
+                await channel.send(msg[:1950] + "\n```" if len(msg) > 1950 else msg)
         except Exception as e:
             logger.error(f"Scheduled GLD DP error: {e}")
 
@@ -743,8 +799,14 @@ async def on_ready():
         await asyncio.to_thread(ensure_symbol_info)
     except Exception as e:
         logger.warning(f"symbol_info check failed: {e}")
+    # Loop 1: Alle 30 Min still zu TradingView pushen
+    auto_push_tradingview.start()
+    logger.info("Auto TradingView Sync gestartet (alle 30 Min, 13-22 UTC)")
+
+    # Loop 2: Zu festen Zeiten in Discord posten
     if SCHEDULE_ENABLED and CHANNEL_ID > 0:
         scheduled_gex.start()
+        logger.info(f"Discord Scheduler gestartet: {SCHEDULE_HOURS} UTC")
 
 
 if __name__ == "__main__":
