@@ -225,7 +225,6 @@ async def _push_dp_to_tradingview(ticker, dp, spot):
 #  Läuft immer während Marktzeiten, kein Discord Post
 # ═══════════════════════════════════════════════════════════
 
-@tasks.loop(minutes=30)
 async def _push_bt_to_tradingview(ticker, prints_data):
     """Helper: Block Trades nach GitHub/TradingView pushen."""
     try:
@@ -300,7 +299,7 @@ async def before_auto_push():
 #  Postet GEX + DP Reports in den Channel
 # ═══════════════════════════════════════════════════════════
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=1)
 async def scheduled_gex():
     """
     Zu festen Uhrzeiten (14:00, 17:00, 20:00 UTC):
@@ -317,13 +316,21 @@ async def scheduled_gex():
     now_de = now_utc.astimezone(de_tz)
     h_de, m_de = now_de.hour, now_de.minute
 
-    # Prüfe ob jetzt eine Post-Zeit ist (±5 Min Toleranz)
+    # Prüfe ob jetzt eine Post-Zeit ist (nur exakte Minute oder +1)
     is_post_time = any(
-        h_de == h and abs(m_de - m) <= 5
+        h_de == h and m_de in (m, m + 1)
         for h, m in SCHEDULE_TIMES_DE
     )
     if not is_post_time:
         return
+
+    # Guard: nicht doppelt posten (unique key pro Stunde+Minute)
+    post_key = f"{h_de:02d}:{m_de:02d}"
+    if not hasattr(scheduled_gex, '_last_post'):
+        scheduled_gex._last_post = ""
+    if scheduled_gex._last_post == post_key:
+        return
+    scheduled_gex._last_post = post_key
 
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
@@ -608,6 +615,27 @@ async def cmd_prints(ctx, ticker: str = "QQQ"):
 
     # Auto-push Block Trades to TradingView
     asyncio.create_task(_push_bt_to_tradingview(ticker, prints))
+    # Save to accumulation history
+    try:
+        acc_ticker = "GLD" if ticker.upper() in ("GLD", "GOLD") else ticker.upper()
+        save_daily_prints(acc_ticker, prints)
+    except Exception as e:
+        logger.warning(f"Accumulation save failed: {e}")
+
+
+@bot.command(name='accum')
+async def cmd_accum(ctx, ticker: str = "Gold"):
+    """!accum [QQQ|Gold] — Zeigt institutionelle Akkumulations-Zonen (7 Tage)"""
+    acc_ticker = "GLD" if ticker.upper() in ("GLD", "GOLD") else ticker.upper()
+    ratio = GOLD_RATIO if acc_ticker == "GLD" else RATIO
+    try:
+        signals = detect_accumulation(acc_ticker)
+        msg = format_accumulation_discord(acc_ticker, signals, ratio)
+    except Exception as e:
+        msg = f"Akkumulation Fehler: {e}"
+    if len(msg) > 1950:
+        msg = msg[:1950] + "\n```"
+    await ctx.send(msg)
 
 
 @bot.command(name='dpmem')
