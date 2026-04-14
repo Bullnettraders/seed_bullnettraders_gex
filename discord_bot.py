@@ -149,32 +149,54 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 #  DARK POOL — CORE POST HELPER
 # ═══════════════════════════════════════════════════════════
 
-async def purge_old_dp_posts(channel, limit=50):
-    """Löscht alle alten Dark Pool Posts des Bots im Channel.
-    Erkennt via DP_MARKER im Text oder im Embed-Titel."""
+async def purge_old_dp_posts(channel, limit=500):
+    """Löscht ALLE alten Bot-Messages im DP Channel.
+    Da es dedizierte DP Channels sind: komplett plattmachen.
+
+    Zwei Phasen:
+      1. Bulk delete für Messages < 14 Tage (schnell)
+      2. Einzel-delete für ältere Messages (Discord API Limit)
+    """
     if channel is None:
         return 0
 
-    def is_old_dp(msg):
-        if msg.author.id != bot.user.id:
-            return False
-        if msg.content and DP_MARKER in msg.content:
-            return True
-        for emb in msg.embeds or []:
-            if emb.title and DP_MARKER in emb.title:
-                return True
-        return False
+    def is_bot_msg(msg):
+        return msg.author.id == bot.user.id
 
+    total_deleted = 0
+
+    # Phase 1: Bulk purge (nur <14 Tage alt)
     try:
-        deleted = await channel.purge(limit=limit, check=is_old_dp, bulk=True)
-        logger.info(f"Purged {len(deleted)} alte DP Messages in #{channel.name}")
-        return len(deleted)
+        deleted = await channel.purge(limit=limit, check=is_bot_msg, bulk=True)
+        total_deleted += len(deleted)
+        logger.info(f"Bulk-purged {len(deleted)} Bot-Messages in #{channel.name}")
     except discord.Forbidden:
-        logger.warning(f"Keine Permission zum Löschen in #{channel.name} (Manage Messages fehlt)")
+        logger.warning(f"❌ Manage Messages Permission fehlt in #{channel.name}")
         return 0
     except Exception as e:
-        logger.warning(f"Purge failed in #{channel.name}: {e}")
-        return 0
+        logger.warning(f"Bulk purge failed in #{channel.name}: {e}")
+
+    # Phase 2: Einzel-delete für >14 Tage alte Bot-Messages
+    try:
+        old_count = 0
+        async for msg in channel.history(limit=limit):
+            if msg.author.id == bot.user.id:
+                try:
+                    await msg.delete()
+                    old_count += 1
+                    await asyncio.sleep(0.3)  # Rate limit freundlich
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    logger.debug(f"Einzel-delete skip: {e}")
+        if old_count > 0:
+            logger.info(f"Einzel-deleted {old_count} alte (>14d) Messages in #{channel.name}")
+            total_deleted += old_count
+    except Exception as e:
+        logger.warning(f"Einzel-delete phase failed: {e}")
+
+    logger.info(f"✅ Purge #{channel.name}: {total_deleted} Messages gesamt gelöscht")
+    return total_deleted
 
 
 def build_dp_embed(dp, meta):
